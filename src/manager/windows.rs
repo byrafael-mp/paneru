@@ -13,10 +13,10 @@ use objc2_core_foundation::{
     CFArray, CFBoolean, CFNumber, CFRetained, CFString, CFType, CGPoint, CGRect, CGSize,
     kCFBooleanFalse, kCFBooleanTrue,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{LazyLock, Mutex, OnceLock, RwLock};
+use std::sync::{LazyLock, OnceLock, RwLock};
 use std::thread;
 use std::time::Duration;
 use stdext::function_name;
@@ -34,20 +34,19 @@ use crate::manager::{Origin, Size, irect_from};
 use crate::platform::{Pid, ProcessSerialNumber, WinID, macos_major_version};
 use crate::util::{AXUIAttributes, AXUIWrapper, MacResult};
 
-/// Per-PID ref-count for the `AXEnhancedUserInterface` workaround. Tracks how many
-/// concurrent window operations are in-flight for each app so the attribute is only
-/// re-enabled after the last one completes (safe under `par_iter_mut`).
-static ENHANCED_UI_REFCOUNT: LazyLock<Mutex<HashMap<Pid, usize>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-/// Apps observed not to have `AXEnhancedUserInterface` set, so the workaround
-/// above can skip them without asking again.
+/// Apps whose AX tree has no `AXEnhancedUserInterface` attribute (the common
+/// case). Skip the workaround entirely after the first failed probe.
 ///
-/// An `RwLock` rather than a `Mutex`: entries are written once and read by
-/// many concurrent `par_iter_mut` workers afterwards, so readers must not
-/// exclude each other. Entries die with the process, so a relaunch (new pid)
-/// is asked afresh.
+/// This is *not* "the attribute is present and currently false". Wispr Flow
+/// and other AX clients flip it on later; treating false as absent left
+/// Firefox/Zen animating AX moves for the rest of the session.
 static ENHANCED_UI_ABSENT: LazyLock<RwLock<HashSet<Pid>>> =
+    LazyLock::new(|| RwLock::new(HashSet::new()));
+
+/// Apps that *do* expose the attribute. After the first probe we only SET it
+/// false, never GET: a GET against Gecko is a cross-process round-trip that
+/// can stall the move by a second while Spotify has already jumped.
+static ENHANCED_UI_KNOWN: LazyLock<RwLock<HashSet<Pid>>> =
     LazyLock::new(|| RwLock::new(HashSet::new()));
 
 /// macOS may partially apply an AX width increase when the requested right edge
@@ -104,6 +103,8 @@ pub trait WindowApi: Send + Sync {
     /// shuffle the floating-vs-tiled tier order. Best-effort: AX raise can't
     /// lift a window above another app's frontmost window.
     fn raise_without_focus(&self);
+    /// Restores `AXEnhancedUserInterface` on quit. Moves leave it off.
+    fn release_ax_lock(&self);
     fn pid(&self) -> Result<Pid>;
     fn set_padding(&mut self, padding: WindowPadding);
     fn horizontal_padding(&self) -> i32;
@@ -166,10 +167,7 @@ pub struct WindowOS {
     border_radius: OnceLock<Option<f64>>,
     pid: OnceLock<Result<Pid>>,
     app_reference: OnceLock<Option<CFRetained<AXUIWrapper>>>,
-    /// Set once this window's app is known not to use
-    /// `AXEnhancedUserInterface` (the common case), so the steady-state check
-    /// in [`Self::disable_enhanced_ui`] is a relaxed atomic load instead of
-    /// contending for the global mutex from every `par_iter_mut` worker.
+    /// Set once this window's app has no `AXEnhancedUserInterface` attribute.
     enhanced_ui_absent: AtomicBool,
 
     /// The last title read off the element, cached because reading one is a
@@ -258,6 +256,9 @@ impl WindowOS {
             window.role().unwrap_or_default(),
             window.subrole().unwrap_or_default(),
         );
+        // Probe and clear enhanced UI now, so the first layout commit is not
+        // the probe (Firefox/Zen would lag that first move by ~1s).
+        window.disable_enhanced_ui();
         Ok(window)
     }
 
@@ -310,23 +311,20 @@ impl WindowOS {
             .clone()
     }
 
-    /// Disables `AXEnhancedUserInterface` on this window's app if it is currently enabled.
+    /// Forces `AXEnhancedUserInterface` off on this window's app.
     ///
-    /// Uses a per-PID ref-count so that concurrent operations on windows of the same app
-    /// (via `par_iter_mut`) keep the attribute disabled until the last caller re-enables it.
+    /// Firefox, Zen, and Chrome animate AX move/resize while that flag is on
+    /// (Wispr Flow and Kindavim turn it on). The OS animation is ~1s, so those
+    /// windows trail Spotify. Leave it off for the whole session; only restore
+    /// it on quit.
     ///
-    /// This avoids animated move/resize that breaks window management for apps like Chrome,
-    /// Firefox, and Zen Browser when accessibility clients (e.g. Kindavim) enable enhanced UI.
+    /// Probe once per pid. "Currently false" is not "missing": an AX client
+    /// can flip it on later. After the probe, SET false without GET.
     fn disable_enhanced_ui(&self) {
-        // Nothing to disable, and nothing to lock or ask: this window's app has
-        // already been found not to use the attribute.
         if self.enhanced_ui_absent.load(Ordering::Relaxed) {
             return;
         }
         let Ok(pid) = self.pid() else { return };
-        // Another window of the same app may have answered the question already.
-        // Taken before the ref-count mutex, since the answer is usually "absent"
-        // and that path should not touch the ref-count at all.
         if ENHANCED_UI_ABSENT
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -335,81 +333,62 @@ impl WindowOS {
             self.enhanced_ui_absent.store(true, Ordering::Relaxed);
             return;
         }
-        // Scoped so the lock isn't held across the accessibility calls below:
-        // each is a synchronous round-trip into another process, and holding a
-        // global mutex across them would serialize every `par_iter_mut` worker
-        // behind the slowest app.
-        {
-            let mut counts = ENHANCED_UI_REFCOUNT
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(count) = counts.get_mut(&pid) {
-                *count += 1;
+        let Some(app_element) = self.app_reference() else {
+            return;
+        };
+        let attr = CFString::from_static_str("AXEnhancedUserInterface");
+        let known = ENHANCED_UI_KNOWN
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&pid);
+        if !known {
+            if app_element.get_attribute::<CFBoolean>(&attr).is_err() {
+                ENHANCED_UI_ABSENT
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(pid);
+                self.enhanced_ui_absent.store(true, Ordering::Relaxed);
                 return;
             }
+            ENHANCED_UI_KNOWN
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(pid);
+        }
+        unsafe {
+            AXUIElementSetAttributeValue(
+                app_element.as_ptr(),
+                attr.as_ref(),
+                kCFBooleanFalse.unwrap(),
+            );
+        }
+    }
+
+    /// Restores `AXEnhancedUserInterface` on quit so AX clients (Kindavim)
+    /// get it back. Not used between moves: re-enabling let Gecko animate
+    /// the next AX set.
+    fn reenable_enhanced_ui(&self) {
+        if self.enhanced_ui_absent.load(Ordering::Relaxed) {
+            return;
+        }
+        let Ok(pid) = self.pid() else { return };
+        if !ENHANCED_UI_KNOWN
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&pid)
+        {
+            return;
         }
         let Some(app_element) = self.app_reference() else {
             return;
         };
         let attr = CFString::from_static_str("AXEnhancedUserInterface");
-        let enabled = app_element
-            .get_attribute::<CFBoolean>(&attr)
-            .is_ok_and(|v| CFBoolean::value(&v));
-        if enabled {
-            unsafe {
-                AXUIElementSetAttributeValue(
-                    app_element.as_ptr(),
-                    attr.as_ref(),
-                    kCFBooleanFalse.unwrap(),
-                );
-            }
-            // Incremented rather than set: two windows of the same app can race
-            // here and both owe a matching `reenable_enhanced_ui`; setting 1
-            // would let the second one decrement past zero.
-            *ENHANCED_UI_REFCOUNT
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .entry(pid)
-                .or_insert(0) += 1;
-        } else {
-            ENHANCED_UI_ABSENT
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(pid);
-            self.enhanced_ui_absent.store(true, Ordering::Relaxed);
-        }
-    }
-
-    /// Re-enables `AXEnhancedUserInterface` on this window's app once the last concurrent
-    /// caller has finished. Pairs with [`disable_enhanced_ui`].
-    fn reenable_enhanced_ui(&self) {
-        // Nothing was disabled, so there is no ref-count entry to find and no
-        // reason to take the lock looking for one.
-        if self.enhanced_ui_absent.load(Ordering::Relaxed) {
-            return;
-        }
-        let Ok(pid) = self.pid() else { return };
-        let mut counts = ENHANCED_UI_REFCOUNT
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(count) = counts.get_mut(&pid) else {
-            return;
-        };
-        *count = count.saturating_sub(1);
-        if *count > 0 {
-            return;
-        }
-        counts.remove(&pid);
-        drop(counts);
-        if let Some(app_element) = self.app_reference() {
-            let attr = CFString::from_static_str("AXEnhancedUserInterface");
-            unsafe {
-                AXUIElementSetAttributeValue(
-                    app_element.as_ptr(),
-                    attr.as_ref(),
-                    kCFBooleanTrue.unwrap(),
-                );
-            }
+        unsafe {
+            AXUIElementSetAttributeValue(
+                app_element.as_ptr(),
+                attr.as_ref(),
+                kCFBooleanTrue.unwrap(),
+            );
         }
     }
 
@@ -584,7 +563,6 @@ impl WindowApi for WindowOS {
         }
         self.disable_enhanced_ui();
         self.set_ax_position(origin);
-        self.reenable_enhanced_ui();
     }
 
     #[instrument(level = Level::TRACE)]
@@ -632,6 +610,9 @@ impl WindowApi for WindowOS {
             }
             self.set_ax_position(target_origin);
         }
+    }
+
+    fn release_ax_lock(&self) {
         self.reenable_enhanced_ui();
     }
 

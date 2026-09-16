@@ -482,6 +482,11 @@ pub(super) fn restore_window_state(
         }
     }
 
+    // Restore puts matched windows back in the strip and clears Unmanaged.
+    // Overlay rules (`floating = true`) still win: otherwise Wispr Flow's
+    // HUD is tiled across restarts and AX-moves with the rest of the strip.
+    super::float_matching_windows(&ctx.windows, &apps, &ctx.config, &mut ctx.commands);
+
     let mut restored_strips = 0;
     for planned in &plan.strips {
         let Some((display_entity, display)) = select_display(

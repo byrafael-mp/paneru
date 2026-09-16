@@ -10,9 +10,9 @@ use bevy::ecs::system::{
 use bevy::math::IRect;
 use bevy::tasks::AsyncComputeTaskPool;
 use bevy::tasks::futures_lite::future;
-use bevy::time::Time;
+use bevy::time::{Time, Timer, TimerMode};
 use objc2_foundation::NSPoint;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
 use std::time::{Duration, Instant};
@@ -38,7 +38,9 @@ use crate::manager::{
 };
 use crate::overlay::{FlashMessageManager, OverlayManager};
 use crate::platform::input::TapHealth;
-use crate::platform::{PlatformCallbacks, WinID};
+use crate::platform::{PlatformCallbacks, WinID, WorkspaceId};
+
+const STALE_STRIP_REAP_INTERVAL_MS: u64 = 500;
 
 /// Processes and applications still inside their spawn grace period, with the
 /// `FreshMarker` that says whether the spawn actually completed in time.
@@ -1088,9 +1090,12 @@ pub(super) fn update_overlays(
 pub(super) fn commit_window_position(
     mut moved_windows: Populated<(&mut Window, &Position), Changed<Position>>,
 ) {
-    moved_windows
-        .par_iter_mut()
-        .for_each(|(mut window, position)| window.reposition(position.0));
+    // Sequential on the system thread (main, SingleThreadedExecutor).
+    // `par_iter_mut` hops to ComputeTaskPool; Firefox/Zen AX from a worker
+    // thread lands about a second late while Spotify has already moved.
+    for (mut window, position) in &mut moved_windows {
+        window.reposition(position.0);
+    }
 }
 
 #[instrument(level = Level::TRACE, skip_all)]
@@ -1118,18 +1123,95 @@ pub(super) fn verify_window_position(
     }
 }
 
+/// Drops strip members the OS no longer reports. Destroy notifications can be
+/// lost (or never sent for Electron helper windows), which leaves a hole in
+/// the layout — empty space next to Linear/T3 Code, Slack sitting on top of
+/// a slot that no longer has a window.
+///
+/// Conservative on purpose: an empty SLS list is treated as a query glitch
+/// (never nuke a populated strip). Immutable window access only — a mutable
+/// `Window` query here reorders the Update schedule and reverses spawn order.
+#[allow(clippy::too_many_arguments)]
+#[instrument(level = Level::DEBUG, skip_all)]
+pub(super) fn reap_stale_strip_windows(
+    mut strips: Query<&mut LayoutStrip>,
+    windows: Windows,
+    window_manager: Res<WindowManager>,
+    restore: Option<Res<crate::ecs::restore::SessionRestore>>,
+    time: Res<Time>,
+    mut interval: Local<Option<Timer>>,
+    mut suspects: Local<HashSet<WinID>>,
+    mut commands: Commands,
+) {
+    if restore.is_some() {
+        return;
+    }
+    let interval = interval.get_or_insert_with(|| {
+        Timer::new(
+            Duration::from_millis(STALE_STRIP_REAP_INTERVAL_MS),
+            TimerMode::Repeating,
+        )
+    });
+    if !interval.tick(time.delta()).just_finished() {
+        return;
+    }
+
+    let mut queried: HashMap<WorkspaceId, HashSet<WinID>> = HashMap::new();
+    for strip in &strips {
+        if queried.contains_key(&strip.id()) {
+            continue;
+        }
+        let Ok(ids) = window_manager.windows_in_workspace(strip.id()) else {
+            return;
+        };
+        queried.insert(strip.id(), ids.into_iter().collect());
+    }
+
+    let all_live: HashSet<WinID> = queried.values().flatten().copied().collect();
+    let mut missing: HashSet<WinID> = HashSet::new();
+
+    for mut strip in &mut strips {
+        let Some(live) = queried.get(&strip.id()) else {
+            continue;
+        };
+        if live.is_empty() {
+            continue;
+        }
+        let members = strip.all_windows();
+        for entity in members {
+            let Some(window) = windows.get(entity) else {
+                strip.remove(entity);
+                continue;
+            };
+            let id = window.id();
+            if live.contains(&id) || all_live.contains(&id) {
+                continue;
+            }
+            // Two consecutive misses. One miss is a space-destroyed restore.
+            if !suspects.contains(&id) {
+                missing.insert(id);
+                continue;
+            }
+            info!("Reaping vanished window {id} from space {}.", strip.id());
+            strip.remove(entity);
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands.try_despawn();
+            }
+        }
+    }
+    *suspects = missing;
+}
+
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn commit_window_size(
     active_display: ActiveDisplay,
     mut resized_windows: Populated<(&mut Window, &Bounds, &mut WidthRatio), Changed<Bounds>>,
 ) {
     let display_bounds = active_display.bounds();
-    resized_windows
-        .par_iter_mut()
-        .for_each(|(mut window, size, mut width_ratio)| {
-            width_ratio.0 = f64::from(size.0.x) / f64::from(display_bounds.width());
-            window.resize(size.0);
-        });
+    for (mut window, size, mut width_ratio) in &mut resized_windows {
+        width_ratio.0 = f64::from(size.0.x) / f64::from(display_bounds.width());
+        window.resize(size.0);
+    }
 }
 
 /// Restores user-visible window state before Paneru shuts down: clears any
@@ -1157,6 +1239,7 @@ pub(super) fn cleanup_on_exit(
         }
 
         for mut window in &mut all_windows {
+            window.release_ax_lock();
             let frame = window.frame();
             let center = frame.center();
             let bounds = display_bounds

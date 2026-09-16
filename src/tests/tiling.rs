@@ -392,6 +392,54 @@ fn test_closing_window_of_live_app_closes_the_gap() {
         .run(commands);
 }
 
+/// A window that disappears with no destroy notification (lost SLS/AX event,
+/// Electron helper, Slack/WhatsApp ghost) must free its column so neighbours
+/// close the gap instead of leaving empty space in the strip.
+#[test]
+fn test_vanished_window_is_reaped_from_the_strip() {
+    let commands = vec![
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(3)
+        .on_iteration(0, |world, state| {
+            let left = window_x(world, 0);
+            assert_eq!(
+                window_x(world, 2) - left,
+                2 * TEST_WINDOW_WIDTH,
+                "three windows should tile side by side before the vanish"
+            );
+            state.os_vanish_window(1);
+        })
+        .on_iteration(4, |world, _state| {
+            assert!(
+                !window_exists(world, 1),
+                "vanished window must be dropped from the world"
+            );
+            assert_eq!(
+                window_x(world, 2) - window_x(world, 0),
+                TEST_WINDOW_WIDTH,
+                "surviving windows must close the gap left by the vanished window"
+            );
+        })
+        .run(commands);
+}
+
 fn window_x(world: &mut World, id: i32) -> i32 {
     let mut query = world.query::<&crate::manager::Window>();
     query

@@ -58,6 +58,7 @@ pub(crate) fn apply_config_side_effects(
     displays: &mut Query<&mut Display>,
     windows: &Windows,
     applications: &Query<&Application>,
+    commands: &mut Commands,
 ) {
     let height = config.menubar_height();
     for mut display in &mut *displays {
@@ -72,6 +73,10 @@ pub(crate) fn apply_config_side_effects(
     {
         update_passthrough(window, app, config);
     }
+
+    // A live-reloaded `floating = true` rule must un-tile matching windows;
+    // otherwise overlays such as Wispr Flow keep a column forever.
+    super::float_matching_windows(windows, applications, config, commands);
 }
 
 /// Handles the event when an application switches to the front. It updates the focused window and PSN.
@@ -1215,18 +1220,11 @@ pub(super) fn apply_window_positions(
             continue;
         };
 
-        if crate::ecs::restore::matches_startup_restore_state(
-            window,
-            app,
-            restore.as_deref(),
-            restoration.as_deref(),
-            &ctx.config,
-        ) {
-            continue;
-        }
-
         let properties = WindowProperties::new(app, window, &ctx.config);
 
+        // Floating is policy, not session layout: an overlay rule must win
+        // even when restore matches this window, or it occupies a column
+        // and AX-moves with the strip (Wispr Flow + Zen lag).
         if properties.floating() {
             if let Some(mut strip) = workspaces
                 .iter_mut()
@@ -1238,6 +1236,16 @@ pub(super) fn apply_window_positions(
                 // Avoid managing window if it's floating.
                 entity_commands.try_insert(Unmanaged::Floating);
             }
+            continue;
+        }
+
+        if crate::ecs::restore::matches_startup_restore_state(
+            window,
+            app,
+            restore.as_deref(),
+            restoration.as_deref(),
+            &ctx.config,
+        ) {
             continue;
         }
 
@@ -1297,6 +1305,7 @@ pub(super) fn apply_window_positions(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn refresh_configuration_trigger(
     mut messages: MessageReader<Event>,
     window_manager: Res<WindowManager>,
@@ -1305,6 +1314,7 @@ pub(super) fn refresh_configuration_trigger(
     windows: Windows,
     mut displays: Query<&mut Display>,
     applications: Query<&Application>,
+    mut commands: Commands,
 ) {
     for event in messages.read() {
         let Event::ConfigRefresh(event) = event else {
@@ -1366,7 +1376,13 @@ pub(super) fn refresh_configuration_trigger(
             });
         }
 
-        apply_config_side_effects(&config, &mut displays, &windows, &applications);
+        apply_config_side_effects(
+            &config,
+            &mut displays,
+            &windows,
+            &applications,
+            &mut commands,
+        );
     }
 }
 

@@ -105,6 +105,10 @@ fn apply(
             };
             strip.swap(left, right);
             commands.reshuffle_around(entity);
+            commands.trigger(crate::ecs::RaiseWindow {
+                entity,
+                with_strip: true,
+            });
         }
 
         LayoutOp::MoveToWorkspace {

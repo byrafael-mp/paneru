@@ -513,7 +513,7 @@ fn test_startup_restore_uses_first_restored_row_when_active_metadata_is_missing(
 }
 
 #[test]
-fn test_startup_restore_overrides_floating_config_for_matched_window() {
+fn test_startup_restore_honors_floating_config_for_matched_window() {
     let mut params = WindowParams::new(".*", Some("test".to_string()));
     params.floating = Some(true);
     let config: Config = (MainOptions::default(), vec![params]).into();
@@ -533,8 +533,18 @@ fn test_startup_restore_overrides_floating_config_for_matched_window() {
     let world = harness.world();
     let restored_window = crate::tests::harness::find_window_entity(0, world);
     assert!(
-        world.entity(restored_window).get::<Unmanaged>().is_none(),
-        "matched restore windows should not inherit floating config"
+        matches!(
+            world.entity(restored_window).get::<Unmanaged>(),
+            Some(Unmanaged::Floating)
+        ),
+        "floating config must un-tile a restored overlay"
+    );
+    let mut query = world.query::<&LayoutStrip>();
+    assert!(
+        !query
+            .iter(world)
+            .any(|strip| strip.contains(restored_window)),
+        "a rule-floated window must not occupy a restored column"
     );
 }
 

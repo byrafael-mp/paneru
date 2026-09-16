@@ -351,6 +351,10 @@ fn command_move_focus(
         // This avoids a race where focus-follows-mouse leaves skip_reshuffle
         // set, causing the WindowFocused handler to skip the reshuffle.
         commands.reshuffle_around(entity);
+        commands.trigger(RaiseWindow {
+            entity,
+            with_strip: true,
+        });
         return;
     }
 
@@ -613,6 +617,10 @@ fn command_swap_focus(
     // and only by the shortfall.
     if let Some(window) = handler() {
         commands.ensure_visible(window);
+        commands.trigger(RaiseWindow {
+            entity: window,
+            with_strip: true,
+        });
     } else {
         debug!(
             "swap {direction:?}: handler returned None (focused={:?}, strip_len={})",

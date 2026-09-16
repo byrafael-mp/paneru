@@ -547,6 +547,7 @@ impl MockState {
         mw.expect_element().return_const(None);
         mw.expect_raise_without_focus().return_const(());
         mw.expect_focus_without_raise().return_const(());
+        mw.expect_release_ax_lock().times(0..).return_const(());
         mw.expect_set_padding().return_const(());
 
         Window::new(Box::new(mw))

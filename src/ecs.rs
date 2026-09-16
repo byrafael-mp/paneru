@@ -25,6 +25,7 @@ use tracing::{Level, error, instrument, warn};
 use crate::commands::register_commands;
 use crate::config::{CONFIGURATION_FILE, Config, WindowParams};
 use crate::ecs::layout::LayoutStrip;
+use crate::ecs::params::Windows;
 use crate::ecs::state::PaneruState;
 use crate::errors::Result;
 use crate::events::{Event, EventSender, InputEvent};
@@ -178,6 +179,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
             )
                 .chain(),
             crate::menubar::update_menu_bar.run_if(vw_indicator_dirty),
+            systems::reap_stale_strip_windows.run_if(not(resource_exists::<Initializing>)),
         ),
     );
 }
@@ -656,11 +658,10 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
     // Run every schedule inline rather than fanning systems out across the task
     // pool: the task-pool handoff measured ~45% of main-thread time against
     // ~16% actually spent on accessibility calls, dropping to ~10% once
-    // inlined. The expensive systems here all take `&mut Window` and are
-    // already mutually exclusive, so the fan-out bought little; genuine
-    // parallelism (`par_iter_mut`) still goes through `ComputeTaskPool`
-    // directly. `First`/`Last` are included even though unused because an
-    // empty schedule still costs a task-pool scope per frame.
+    // inlined. AX commits stay on this thread too (`iter_mut`, not
+    // `par_iter_mut`): Firefox/Zen apply off-thread AX about a second late.
+    // `First`/`Last` are included even though unused because an empty
+    // schedule still costs a task-pool scope per frame.
     for label in [
         First.intern(),
         PreUpdate.intern(),
@@ -794,5 +795,28 @@ impl WindowProperties {
             .iter()
             .find_map(|props| props.horizontal_padding)
             .unwrap_or(0)
+    }
+}
+
+/// Marks every currently tiled window that matches a `floating = true` rule.
+/// The `On<Add, Unmanaged>` observer then drops it from the strip, so a
+/// session restore or a config reload cannot leave an overlay occupying a
+/// column.
+pub(crate) fn float_matching_windows(
+    windows: &Windows,
+    apps: &Query<&Application>,
+    config: &Config,
+    commands: &mut Commands,
+) {
+    for (window, entity, child) in windows.managed_iter() {
+        let Ok(app) = apps.get(child.parent()) else {
+            continue;
+        };
+        if !WindowProperties::new(app, window, config).floating() {
+            continue;
+        }
+        if let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_insert(Unmanaged::Floating);
+        }
     }
 }

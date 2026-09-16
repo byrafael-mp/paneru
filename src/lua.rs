@@ -232,7 +232,13 @@ pub fn drain_lua_outbox(
                 // effects a TOML reload does.
                 if let (Some(config), Some(built)) = (config.as_ref(), worker.built_config()) {
                     config.replace_inner_from(&built);
-                    apply_config_side_effects(config, &mut displays, &windows, &applications);
+                    apply_config_side_effects(
+                        config,
+                        &mut displays,
+                        &windows,
+                        &applications,
+                        &mut commands,
+                    );
                 }
             }
         }
