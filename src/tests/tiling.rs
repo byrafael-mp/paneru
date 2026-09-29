@@ -440,6 +440,43 @@ fn test_vanished_window_is_reaped_from_the_strip() {
         .run(commands);
 }
 
+/// A minimized window remains in the macOS workspace list. If its accessibility
+/// notification is missed, the periodic reconciler must still remove it from
+/// the tiled strip so its neighbour does not keep an empty column.
+#[test]
+fn test_missed_minimize_notification_releases_tiled_slot() {
+    let commands = vec![
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(3)
+        .on_iteration(0, |world, state| {
+            assert_eq!(
+                window_x(world, 2) - window_x(world, 0),
+                2 * TEST_WINDOW_WIDTH,
+                "three windows should tile side by side before minimizing"
+            );
+            // Change the OS state without queueing WindowMinimized, matching
+            // the notification loss that previously left a permanent gap.
+            state.update_window(1, |window| window.minimized = true);
+        })
+        .on_iteration(1, |world, _state| {
+            assert!(window_exists(world, 1), "minimized windows stay tracked");
+            assert_eq!(
+                window_x(world, 2) - window_x(world, 0),
+                TEST_WINDOW_WIDTH,
+                "the remaining tiled windows must close the minimized window's slot"
+            );
+        })
+        .run(commands);
+}
+
 fn window_x(world: &mut World, id: i32) -> i32 {
     let mut query = world.query::<&crate::manager::Window>();
     query

@@ -1123,10 +1123,10 @@ pub(super) fn verify_window_position(
     }
 }
 
-/// Drops strip members the OS no longer reports. Destroy notifications can be
-/// lost (or never sent for Electron helper windows), which leaves a hole in
-/// the layout — empty space next to Linear/T3 Code, Slack sitting on top of
-/// a slot that no longer has a window.
+/// Reconciles strip members with the OS when accessibility notifications are
+/// lost or arrive late. This removes ghost columns after a close or quit and
+/// releases a tiled slot when a missed minimize notification leaves a window
+/// in the strip.
 ///
 /// Conservative on purpose: an empty SLS list is treated as a query glitch
 /// (never nuke a populated strip). Immutable window access only — a mutable
@@ -1184,6 +1184,36 @@ pub(super) fn reap_stale_strip_windows(
                 continue;
             };
             let id = window.id();
+
+            // A minimized window remains in its macOS space, so the SLS list
+            // below still calls it live. Reconcile its AX state separately:
+            // otherwise a dropped kAXWindowMiniaturizedNotification leaves a
+            // permanently blank tiled column. Inserting Unmanaged lets the
+            // existing observer preserve its prior strip for restoration.
+            if window.is_minimized() {
+                info!("Reaping missed minimize notification for window {id}.");
+                if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                    entity_commands.try_insert(crate::ecs::Unmanaged::Minimized);
+                }
+                continue;
+            }
+
+            // An AX lookup failure is definitive even if the window server
+            // still has a stale membership record while the owning app exits.
+            // Do not use a successful lookup as evidence of life: some apps
+            // retain a dead AX element briefly after closing a window.
+            if window.role().is_err() {
+                info!(
+                    "Reaping inaccessible window {id} from space {}.",
+                    strip.id()
+                );
+                strip.remove(entity);
+                if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                    entity_commands.try_despawn();
+                }
+                continue;
+            }
+
             if live.contains(&id) || all_live.contains(&id) {
                 continue;
             }
