@@ -13,13 +13,16 @@ use tracing::{debug, error, info};
 mod query;
 
 use crate::config::Config;
+use crate::config::snippet::{RuleSubject, SnippetDialect, window_rule_snippet};
 use crate::ecs::display::FloatingLayer;
 use crate::ecs::focus::FocusHistory;
-use crate::ecs::layout::{Column, LayoutStrip, StackItem, clamp_origin_to_viewport};
+use crate::ecs::layout::{
+    Column, LayoutStrip, MIN_WINDOW_HEIGHT, StackItem, clamp_origin_to_viewport, strip_signature,
+};
 use crate::ecs::params::{ActiveDisplay, ActiveDisplayMut, Windows};
 use crate::ecs::{
     ActiveDisplayMarker, ActiveWorkspaceMarker, Bounds, DockPosition, FocusedMarker,
-    FullWidthMarker, NativeFullscreenMarker, RaiseWindow, SelectedVirtualMarker,
+    FullWidthMarker, ManualStripOffset, NativeFullscreenMarker, RaiseWindow, SelectedVirtualMarker,
     SendMessageTrigger, SpawnCommandsExt, Timeout, Unmanaged,
 };
 use crate::events::Event;
@@ -27,9 +30,7 @@ use crate::manager::{Application, Display, Origin, Size, Window, WindowManager, 
 use crate::platform::WorkspaceId;
 use crate::util::round_px;
 
-// The command vocabulary itself lives in the `paneru-command` crate, shared with
-// the Lua API in `crates/lua-api` so every host speaks the same types.
-pub use paneru_shared_types::commands::{
+pub use crate::types::commands::{
     Command, Direction, MouseMove, MoveFocus, Operation, ResizeDirection,
 };
 
@@ -76,6 +77,7 @@ pub fn register_commands(app: &mut bevy::app::App) {
             print_internal_state_handler,
             mouse_to_next_display,
             resize_window,
+            resize_window_vertical,
             command_center_window,
             full_width_window,
             to_next_display,
@@ -92,6 +94,13 @@ pub fn register_commands(app: &mut bevy::app::App) {
             snap_window,
         ),
     );
+    // A separate registration because the tuple above is already at Bevy's
+    // 20-system limit.
+    //
+    // A default dialect so the mock harness has one; the real app overwrites it
+    // once it knows whether a Lua script took over the configuration.
+    app.init_resource::<SnippetDialect>();
+    app.add_systems(PreUpdate, (copy_window_rule, toggle_tabbed_display_handler));
 }
 
 pub fn filter_window_operations<'a, F: Fn(&Operation) -> bool>(
@@ -123,7 +132,7 @@ pub fn filter_window_operations<'a, F: Fn(&Operation) -> bool>(
 ///
 /// `Some(Entity)` with the found window's entity, otherwise `None`.
 #[instrument(level = Level::DEBUG, ret)]
-fn get_window_in_direction(
+pub(crate) fn get_window_in_direction(
     direction: &Direction,
     entity: Entity,
     strip: &LayoutStrip,
@@ -249,6 +258,24 @@ fn nearest_float_in_direction(
 /// # Returns
 ///
 /// `Some(Entity)` with the entity of the newly focused window, otherwise `None`.
+fn focus_with_verification(
+    entity: Entity,
+    focused_entity: Option<Entity>,
+    commands: &mut Commands,
+) {
+    if focused_entity != Some(entity)
+        && let Ok(mut entity_commands) = commands.get_entity(entity)
+    {
+        entity_commands.try_insert((
+            crate::ecs::VerifyFocus,
+            Timeout::for_component::<crate::ecs::VerifyFocus>(
+                crate::ecs::focus::VERIFY_FOCUS_TIMEOUT,
+            ),
+        ));
+    }
+    commands.focus_entity(entity, true);
+}
+
 fn command_move_focus(
     mut messages: MessageReader<Event>,
     windows: Windows,
@@ -285,7 +312,7 @@ fn command_move_focus(
 
         if let Some(entity) = strip.and_then(|strip| strip.last().ok().and_then(|col| col.top())) {
             debug!("fullscreen: swap raising {entity}");
-            commands.focus_entity(entity, true);
+            focus_with_verification(entity, windows.focused().map(|(_, e)| e), &mut commands);
         }
         return;
     }
@@ -305,7 +332,7 @@ fn command_move_focus(
             active_strip.id(),
             active_display.bounds(),
         ) {
-            commands.focus_entity(entity, true);
+            focus_with_verification(entity, Some(focused_entity), &mut commands);
         }
         return;
     }
@@ -346,7 +373,7 @@ fn command_move_focus(
     };
 
     if let Some(entity) = candidate {
-        commands.focus_entity(entity, true);
+        focus_with_verification(entity, Some(focused_entity), &mut commands);
         // Explicitly reshuffle so the target window is brought into view.
         // This avoids a race where focus-follows-mouse leaves skip_reshuffle
         // set, causing the WindowFocused handler to skip the reshuffle.
@@ -615,7 +642,8 @@ fn command_swap_focus(
     // stays put and per-window animation slides the window into the slot.
     // Only when the slot would fall off the edge does the strip scroll —
     // and only by the shortfall.
-    if let Some(window) = handler() {
+    let swapped = handler();
+    if let Some(window) = swapped {
         commands.ensure_visible(window);
         commands.trigger(RaiseWindow {
             entity: window,
@@ -629,11 +657,12 @@ fn command_swap_focus(
         );
     }
 
-    if windows
-        .focused()
-        .and_then(|(_, current)| get_window_in_direction(direction, current, active_strip))
-        .is_none()
-    {
+    // Only fall through to the neighbouring display when there was nothing to
+    // swap with in the first place. Re-querying the strip here would look at
+    // the layout *after* the swap, where the window has by definition no
+    // neighbour left in that direction - which sent every successful vertical
+    // swap straight on to the other display.
+    if swapped.is_none() {
         // Check if the movement can swap to another display.
         if !config.display_fallthrough() {
             return;
@@ -653,6 +682,23 @@ fn command_swap_focus(
                 command: Command::Window(Operation::ToNextDisplay(MoveFocus::Follow)),
             }));
         }
+    }
+}
+
+/// Records that the user placed this strip's offset by hand, so
+/// `reshuffle_layout_strip` keeps it instead of re-deriving one from the
+/// focused window's frame. The mark is dropped again as soon as the strip's
+/// shape changes, the user swipes, or a window has to be scrolled into view.
+fn mark_manual_offset(
+    strip_entity: Entity,
+    strip: &LayoutStrip,
+    windows: &Windows,
+    commands: &mut Commands,
+) {
+    if let Ok(mut entity_commands) = commands.get_entity(strip_entity) {
+        entity_commands.try_insert(ManualStripOffset {
+            signature: strip_signature(strip, windows),
+        });
     }
 }
 
@@ -681,9 +727,19 @@ fn command_center_window(
         if active_display.active_strip().contains(entity)
             && let Some(layout_position) = windows.layout_position(entity)
         {
-            // Directly reposition the strip (bypasses hidden_ratio check).
+            // Directly reposition the strip (bypasses hidden_ratio check), and
+            // record the placement as deliberate so a later reshuffle — a
+            // repeated focus event, a return from another display — does not
+            // re-derive the offset and undo the centering.
             let strip_position = origin - layout_position.0;
-            commands.reposition_entity(active_display.active_strip_entity(), strip_position);
+            let strip_entity = active_display.active_strip_entity();
+            commands.reposition_entity(strip_entity, strip_position);
+            mark_manual_offset(
+                strip_entity,
+                active_display.active_strip(),
+                &windows,
+                &mut commands,
+            );
         } else {
             commands.reposition_entity(entity, origin);
         }
@@ -790,6 +846,120 @@ fn resize_window(
     commands.reshuffle_around(entity);
 }
 
+/// Cycles the focused window's height through `preset_stack_heights`, letting
+/// the neighbour below (or above, when the window is last) absorb the
+/// difference.
+///
+/// Only stacks are eligible: `binpack_heights` stretches a column's lone member
+/// to the full strip height, so a height written anywhere else is overwritten on
+/// the next layout pass.
+fn resize_window_vertical(
+    mut messages: MessageReader<Event>,
+    windows: Windows,
+    active_display: ActiveDisplay,
+    config: Res<Config>,
+    mut commands: Commands,
+) {
+    let Some(&Operation::ResizeVertical(direction)) =
+        filter_window_operations(&mut messages, |op| {
+            matches!(op, Operation::ResizeVertical(_))
+        })
+        .next()
+    else {
+        return;
+    };
+
+    let Some((_, entity)) = windows.focused() else {
+        return;
+    };
+
+    let strip = active_display.active_strip();
+    let Some(Column::Stack(items)) = strip
+        .index_of(entity)
+        .ok()
+        .and_then(|index| strip.get(index).ok())
+    else {
+        return;
+    };
+    let Some(position) = items.iter().position(|item| item.contains(entity)) else {
+        return;
+    };
+    let neighbour = if position + 1 < items.len() {
+        position + 1
+    } else if position > 0 {
+        position - 1
+    } else {
+        return;
+    };
+
+    // Pending resizes count: holding the key down must keep advancing through
+    // the presets instead of re-reading a mid-animation height.
+    let Some((frame, neighbour_frame)) = items[position]
+        .top()
+        .and_then(|entity| windows.moving_frame(entity))
+        .zip(
+            items[neighbour]
+                .top()
+                .and_then(|entity| windows.moving_frame(entity)),
+        )
+    else {
+        return;
+    };
+
+    let pair = frame.height() + neighbour_frame.height();
+    if pair < 2 * MIN_WINDOW_HEIGHT {
+        return;
+    }
+
+    let viewport = active_display.actual_bounds(&config);
+    let current_ratio = f64::from(frame.height()) / f64::from(viewport.height());
+    let heights = config.preset_stack_heights();
+    let fallback = *heights.first().unwrap_or(&0.5);
+    let cycle = config.window_resize_cycle();
+    // The presets are assumed sorted ascending, and the `0.05` dead-band keeps
+    // float noise from re-selecting the preset the window is already at.
+    let next_ratio = match direction {
+        ResizeDirection::Grow => heights
+            .iter()
+            .copied()
+            .find(|&r| r > current_ratio + 0.05)
+            .unwrap_or_else(|| {
+                if cycle {
+                    fallback
+                } else {
+                    *heights.last().unwrap_or(&fallback)
+                }
+            }),
+        ResizeDirection::Shrink => heights
+            .iter()
+            .rev()
+            .copied()
+            .find(|&r| r < current_ratio - 0.05)
+            .unwrap_or_else(|| {
+                if cycle {
+                    *heights.last().unwrap_or(&fallback)
+                } else {
+                    fallback
+                }
+            }),
+    };
+    let new_height = round_px(next_ratio * f64::from(viewport.height()))
+        .clamp(MIN_WINDOW_HEIGHT, pair - MIN_WINDOW_HEIGHT);
+
+    // Leaving the pair's total untouched is what makes the new height survive
+    // `binpack_heights`, which hands the column's last item the remainder.
+    for (item, height) in [
+        (&items[position], new_height),
+        (&items[neighbour], pair - new_height),
+    ] {
+        for entity in item.window_iter() {
+            if let Some(size) = windows.size(entity) {
+                commands.resize_entity(entity, size.with_y(height));
+            }
+        }
+    }
+}
+
 fn full_width_window(
     mut messages: MessageReader<Event>,
     windows: Windows,
@@ -893,6 +1063,55 @@ fn manage_window(
     {
         strip.append(entity);
         commands.reshuffle_around(entity);
+    }
+}
+
+/// Copies a `[windows]` configuration rule for the focused window to the
+/// clipboard, so the user can paste a working starting point instead of
+/// guessing the app's bundle id and transcribing the title into a regex.
+fn copy_window_rule(
+    mut messages: MessageReader<Event>,
+    windows: Windows,
+    apps: Query<&Application>,
+    dialect: Res<SnippetDialect>,
+    mut commands: Commands,
+) {
+    if filter_window_operations(&mut messages, |op| matches!(op, Operation::CopyRule))
+        .next()
+        .is_none()
+    {
+        return;
+    }
+
+    let Some((window, app)) = windows
+        .focused()
+        .and_then(|(window, _)| windows.find_parent(window.id()))
+        .and_then(|(window, _, app_entity)| Some((window, apps.get(app_entity).ok()?)))
+    else {
+        debug!("no focused window to copy a rule for");
+        return;
+    };
+
+    let bundle_id = app.bundle_id().unwrap_or_default();
+    let title = window.title().unwrap_or_default();
+    let role = window.role().unwrap_or_default();
+    let subrole = window.subrole().unwrap_or_default();
+    let snippet = window_rule_snippet(
+        *dialect,
+        &RuleSubject {
+            app_name: app.name(),
+            bundle_id: &bundle_id,
+            title: &title,
+            role: &role,
+            subrole: &subrole,
+        },
+    );
+
+    if crate::pasteboard::copy_to_clipboard(&snippet) {
+        info!("copied window rule for {}", app.name());
+        commands.flash_message("Window rule copied".to_owned(), 1.5);
+    } else {
+        error!("unable to copy the window rule to the clipboard");
     }
 }
 
@@ -1205,7 +1424,14 @@ fn snap_window(
     frame.max = frame.min + size;
 
     let strip_position = frame.min - layout_position.0;
-    commands.reposition_entity(active_display.active_strip_entity(), strip_position);
+    let strip_entity = active_display.active_strip_entity();
+    commands.reposition_entity(strip_entity, strip_position);
+    mark_manual_offset(
+        strip_entity,
+        active_display.active_strip(),
+        &windows,
+        &mut commands,
+    );
 }
 
 #[instrument(level = Level::DEBUG, skip_all)]
@@ -1245,6 +1471,46 @@ pub fn stack_windows_handler(
         // edge-clamp in reshuffle_layout_strip keeps the strip pinned so the
         // leftmost window touches the left edge and the rightmost the right.
         commands.reshuffle_around(entity);
+    }
+}
+
+/// Toggles the focused window's stack between a normal split display and a
+/// tabbed display (one window visible at a time, sharing the full column
+/// rect — cycle with the existing `Focus` North/South directions). A no-op
+/// on anything that isn't a multi-window `Column::Stack`.
+#[instrument(level = Level::DEBUG, skip_all)]
+pub fn toggle_tabbed_display_handler(
+    mut messages: MessageReader<Event>,
+    windows: Windows,
+    mut active_display: ActiveDisplayMut,
+    mut commands: Commands,
+) {
+    if filter_window_operations(&mut messages, |op| {
+        matches!(op, Operation::ToggleTabbedDisplay)
+    })
+    .next()
+    .is_none()
+    {
+        return;
+    }
+
+    if let Some((_, entity, unmanaged)) = windows
+        .focused()
+        .and_then(|(_, entity)| windows.get_managed(entity))
+        && unmanaged.is_none()
+    {
+        let strip = active_display.active_strip();
+        // `None` means the toggle wasn't applicable (not in a multi-window
+        // Stack) — stay silent rather than reporting it the same way as a
+        // real "turned tabs off", which previously made repeated presses on
+        // a non-stacked window look like a stuck toggle.
+        if let Some(now_tabbed) = strip.toggle_tabbed_display(entity) {
+            commands.reshuffle_around(entity);
+            commands.flash_message(
+                if now_tabbed { "Tabs on" } else { "Tabs off" }.to_string(),
+                1.0,
+            );
+        }
     }
 }
 

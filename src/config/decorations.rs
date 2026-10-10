@@ -1,20 +1,24 @@
 use serde::{Deserialize, Deserializer, de};
 
 #[derive(Deserialize, Clone, Debug, Default)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub struct DecorationsOptions {
     pub active: Option<GeneralDecorationsOptions>,
     pub inactive: Option<GeneralDecorationsOptions>,
     pub workspace_menu_status: Option<bool>,
+    pub menu: Option<MenubarOptions>,
     pub workspace_popup_status: Option<bool>,
 }
 
 #[derive(Deserialize, Clone, Debug, Default)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub struct GeneralDecorationsOptions {
     pub border: Option<GeneralBorderOptions>,
     pub dim: Option<GeneralDimOptions>,
 }
 
 #[derive(Deserialize, Clone, Debug, Default)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub struct GeneralBorderOptions {
     /// Is border enabled
     /// Default: false.
@@ -36,6 +40,7 @@ pub struct GeneralBorderOptions {
 }
 
 #[derive(Deserialize, Clone, Debug, Default)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub struct GeneralDimOptions {
     /// Opacity of the dim overlay on inactive windows (0.0=off, 1.0=fully black).
     /// Default: 0.0 (disabled).
@@ -46,7 +51,92 @@ pub struct GeneralDimOptions {
     /// Default: "#000000" (black).
     pub color: Option<String>,
 }
+#[derive(Deserialize, Debug, Clone, Default)]
+#[cfg_attr(test, derive(serde::Serialize))]
+pub struct MenubarOptions {
+    pub orientation: Option<MenubarOrientation>,
+    pub colors: Option<Vec<String>>,
+    pub angle: Option<f64>,
+    pub descriptor: Option<MenubarDescriptorOptions>,
+    pub indicator: Option<MenubarIndicatorOptions>,
+}
+#[derive(Deserialize, Debug, Clone, Default)]
+#[cfg_attr(test, derive(serde::Serialize))]
+pub struct MenubarDescriptorOptions {
+    /// How the graphic/text descriptor to the left of the
+    /// VW #(s) is displayed. Options are symbol, text, both
+    /// or Hidden. Default is symbol.
+    pub style: Option<DescriptorStyle>,
+    /// Text string preceding VW #(s)
+    /// Defaults to "VW"
+    pub text: Option<String>,
+    /// Symbol System Name (SF Symbols)
+    /// Defaults to "fish.fill"
+    pub symbol: Option<String>,
+}
+#[derive(Deserialize, Debug, Clone, Copy, Default)]
+#[cfg_attr(test, derive(serde::Serialize))]
+pub struct MenubarIndicatorOptions {
+    /// Format for virtual workspace indicator. Options are mono,
+    /// which shows just the current workspace, or multi, which
+    /// shows all active workspaces.
+    /// Defaults to mono.
+    pub style: Option<IndicatorStyle>,
+    /// Character style for virtual workspace indicator. Options
+    /// are default (1 or 1 2 3), roman (I or I II III), or
+    /// unicode (incompatible with mono or ○ ☉ ○). Roman
+    /// only properly formats numbers < 90.
+    pub format: Option<IndicatorFormat>,
+    /// Font size in pt.
+    /// Defaults to 13
+    pub font_size: Option<f64>,
+    /// Only relevant for multi style/Unicode format.
+    /// Defaults to ☉
+    pub active_character: Option<char>,
+    /// Only relevant for multi style/Unicode format.
+    /// Defaults to ○
+    pub inactive_character: Option<char>,
+}
+#[derive(Deserialize, Debug, Copy, Clone, PartialEq, Eq)]
+#[cfg_attr(test, derive(serde::Serialize))]
+#[serde(rename_all = "lowercase")]
+pub enum IndicatorFormat {
+    Default,
+    Roman,
+    // If set must define active/inactive char. Only relevant for multi style
+    Unicode,
+    // Inactive workspaces as the inactive char, the active one as its number.
+    // Only relevant for multi style
+    Marked,
+}
+#[derive(Deserialize, Debug, Copy, Clone, PartialEq, Eq)]
+#[cfg_attr(test, derive(serde::Serialize))]
+#[serde(rename_all = "lowercase")]
+pub enum MenubarOrientation {
+    Default,
+    Flipped,
+}
+#[derive(Deserialize, Debug, Copy, Clone, PartialEq, Eq)]
+#[cfg_attr(test, derive(serde::Serialize))]
+#[serde(rename_all = "lowercase")]
+pub enum IndicatorStyle {
+    Mono,
+    Multi,
+    // The active workspace over how many there are: "2 / 4".
+    Paged,
+}
+#[derive(Deserialize, Debug, Copy, Clone, PartialEq, Eq)]
+#[cfg_attr(test, derive(serde::Serialize))]
+#[serde(rename_all = "lowercase")]
+pub enum DescriptorStyle {
+    Symbol,
+    Text,
+    Both,
+    Hidden,
+}
+
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub enum BorderRadiusOption {
     Auto,
     Value(f64),

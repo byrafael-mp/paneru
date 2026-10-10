@@ -4,7 +4,7 @@
 //! TOML `[bindings]` keys are split into, so parsing and formatting live
 //! together here and are checked against each other by round-trip tests.
 
-use crate::commands::{
+use crate::types::commands::{
     Command, Direction, MouseMove, MoveFocus, Operation, ResizeDirection,
     parse_virtual_workspace_number,
 };
@@ -79,18 +79,31 @@ fn parse_operation(argv: &[&str]) -> Result<Operation> {
         ),
         "grow" => Operation::Resize(ResizeDirection::Grow),
         "shrink" => Operation::Resize(ResizeDirection::Shrink),
+        // `window_vertical_resize` / `_grow` / `_shrink`, plus the explicit
+        // `window_vertical_resize_shrink` mirroring `window_resize_shrink`.
+        "vertical" => Operation::ResizeVertical(match argv.get(1).copied() {
+            None | Some("resize") => argv
+                .get(2)
+                .map_or(Ok(ResizeDirection::Grow), |arg| ResizeDirection::parse(arg))?,
+            Some(arg) => ResizeDirection::parse(arg)?,
+        }),
         "fullwidth" => Operation::FullWidth,
         "manage" => Operation::Manage,
         "equalize" => Operation::Equalize,
         "balance" => Operation::Balance,
         "stack" => Operation::Stack(true),
         "unstack" => Operation::Stack(false),
+        "tabbeddisplay" => Operation::ToggleTabbedDisplay,
         "nextdisplay" => Operation::ToNextDisplay(MoveFocus::Follow),
         "nextdisplaysend" => Operation::ToNextDisplay(MoveFocus::Stay),
         "snap" => Operation::Snap,
+        "copyrule" => Operation::CopyRule,
         // The `virtual*` verbs take either a direction or a workspace number,
         // and `num` variants that only take a number.
         "virtual" => virtual_target(argument()?, Operation::Virtual, Operation::VirtualNumber)?,
+        // No numeric form: "focus a stack neighbor, else switch" only makes
+        // sense paired with a direction.
+        "virtualfocus" => Operation::FocusOrVirtual(Direction::parse(argument()?)?),
         "virtualnum" => Operation::VirtualNumber(parse_virtual_workspace_number(argument()?)?),
         "virtualadd" => Operation::VirtualAdd,
         "virtualmove" => virtual_target(
@@ -170,6 +183,9 @@ impl Operation {
             Operation::Swap(direction) => vec!["swap".to_string(), direction.token()],
             Operation::Center => owned(&["center"]),
             Operation::Resize(direction) => owned(&["resize", direction.token()]),
+            Operation::ResizeVertical(direction) => {
+                owned(&["vertical", "resize", direction.token()])
+            }
             // `SetWidth` comes from window rules, not from a command line; it has
             // no argv verb, so encode it as the equivalent full-width toggle.
             Operation::SetWidth(_) | Operation::FullWidth => owned(&["fullwidth"]),
@@ -180,8 +196,12 @@ impl Operation {
             Operation::Manage => owned(&["manage"]),
             Operation::Stack(true) => owned(&["stack"]),
             Operation::Stack(false) => owned(&["unstack"]),
+            Operation::ToggleTabbedDisplay => owned(&["tabbeddisplay"]),
             Operation::Snap => owned(&["snap"]),
             Operation::Virtual(direction) => vec!["virtual".to_string(), direction.token()],
+            Operation::FocusOrVirtual(direction) => {
+                vec!["virtualfocus".to_string(), direction.token()]
+            }
             Operation::VirtualNumber(index) => {
                 vec!["virtualnum".to_string(), (index + 1).to_string()]
             }
@@ -202,6 +222,7 @@ impl Operation {
             Operation::FocusManaged => owned(&["focus", "managed"]),
             Operation::RaiseFloating => owned(&["raise", "floating"]),
             Operation::ToggleFloatingLayer => owned(&["togglefloatlayer"]),
+            Operation::CopyRule => owned(&["copyrule"]),
         }
     }
 }
@@ -224,6 +245,8 @@ mod tests {
             Operation::Swap(Direction::West),
             Operation::Center,
             Operation::Resize(ResizeDirection::Shrink),
+            Operation::ResizeVertical(ResizeDirection::Grow),
+            Operation::ResizeVertical(ResizeDirection::Shrink),
             Operation::FullWidth,
             Operation::ToNextDisplay(MoveFocus::Follow),
             Operation::ToNextDisplay(MoveFocus::Stay),
@@ -232,8 +255,11 @@ mod tests {
             Operation::Manage,
             Operation::Stack(true),
             Operation::Stack(false),
+            Operation::ToggleTabbedDisplay,
             Operation::Snap,
             Operation::Virtual(Direction::First),
+            Operation::FocusOrVirtual(Direction::North),
+            Operation::FocusOrVirtual(Direction::South),
             Operation::VirtualNumber(2),
             Operation::VirtualMove(Direction::East, MoveFocus::Follow),
             Operation::VirtualMove(Direction::East, MoveFocus::Stay),
@@ -243,6 +269,7 @@ mod tests {
             Operation::FocusManaged,
             Operation::RaiseFloating,
             Operation::ToggleFloatingLayer,
+            Operation::CopyRule,
         ];
 
         for operation in operations {

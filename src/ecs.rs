@@ -1,12 +1,14 @@
 use std::sync::mpsc::Receiver;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bevy::MinimalPlugins;
 use bevy::app::App as BevyApp;
 use bevy::app::{First, Last, PostUpdate, PreUpdate, Startup};
 use bevy::ecs::hierarchy::ChildOf;
+use bevy::ecs::lifecycle::RemovedComponents;
 use bevy::ecs::query::{Added, Changed, With};
 use bevy::ecs::resource::Resource;
+use bevy::ecs::schedule::SystemCondition;
 use bevy::ecs::schedule::common_conditions::{not, resource_exists};
 use bevy::ecs::schedule::{ScheduleLabel as _, SingleThreadedExecutor};
 use bevy::ecs::system::{Commands, EntityCommands, Query, Res, SystemId};
@@ -23,7 +25,8 @@ use derive_more::{Deref, DerefMut};
 use tracing::{Level, error, instrument, warn};
 
 use crate::commands::register_commands;
-use crate::config::{CONFIGURATION_FILE, Config, WindowParams};
+use crate::config::snippet::SnippetDialect;
+use crate::config::{CONFIGURATION_FILE, Config, InitialWindowWidth, WindowParams};
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::Windows;
 use crate::ecs::state::PaneruState;
@@ -67,7 +70,9 @@ pub(crate) use triggers::apply_config_side_effects;
 /// * `app` - The Bevy application to register the systems with.
 #[allow(clippy::too_many_lines)]
 pub fn register_systems(app: &mut bevy::app::App) {
-    const LOW_POWER_MODE_CHECK_SEC: u64 = 60;
+    const CLOSED_WINDOW_CHECK_FREQ: Duration = Duration::from_secs(1);
+    const LOW_POWER_MODE_CHECK: Duration = Duration::from_mins(1);
+    const APP_OBSERVABILITY_CHECK_FREQ: Duration = Duration::from_millis(200);
 
     let not_swiping = |scrolling: Query<&Scrolling, With<ActiveWorkspaceMarker>>| {
         scrolling
@@ -94,6 +99,13 @@ pub fn register_systems(app: &mut bevy::app::App) {
                 || !workspace_changed.is_empty()
                 || !focused_moved.is_empty()
         };
+    // The menu bar additionally shows how many virtual workspaces exist, so it
+    // has to redraw when one is created or reaped, neither of which touches the
+    // active strip.
+    let strip_count_changed =
+        |added: Query<(), Added<LayoutStrip>>, mut removed: RemovedComponents<LayoutStrip>| {
+            !added.is_empty() || removed.read().next().is_some()
+        };
     let native_tabs_enabled =
         |config: Option<Res<Config>>| config.is_none_or(|config| config.native_tabs_enabled());
 
@@ -112,8 +124,11 @@ pub fn register_systems(app: &mut bevy::app::App) {
     app.add_systems(
         PreUpdate,
         (
-            systems::window_creation_event,
             systems::pump_events,
+            // Read creation notifications in the same frame that pumps them.
+            // Otherwise an idle pump can wait up to its next timeout before
+            // the first resize of a newly visible window.
+            systems::window_creation_event.after(systems::pump_events),
             systems::demux_input_events.after(systems::pump_events),
         ),
     );
@@ -125,7 +140,8 @@ pub fn register_systems(app: &mut bevy::app::App) {
                 systems::detect_tabbed_windows.run_if(native_tabs_enabled),
                 triggers::apply_window_positions,
             )
-                .chain(),
+                .chain()
+                .after(systems::finish_setup),
             (
                 systems::add_existing_process,
                 systems::add_existing_application,
@@ -133,14 +149,22 @@ pub fn register_systems(app: &mut bevy::app::App) {
             )
                 .chain()
                 .run_if(resource_exists::<Initializing>),
-            systems::add_launched_process,
-            systems::add_launched_application,
+            systems::add_launched_process.run_if(on_timer(APP_OBSERVABILITY_CHECK_FREQ)),
+            systems::add_launched_application.run_if(on_timer(APP_OBSERVABILITY_CHECK_FREQ)),
             systems::fresh_marker_cleanup,
             systems::timeout_ticker,
+            workspace::cleanup_unordered_windows
+                .run_if(not(resource_exists::<Initializing>))
+                .run_if(on_timer(CLOSED_WINDOW_CHECK_FREQ)),
+            systems::regroup_stray_native_tabs
+                .run_if(native_tabs_enabled)
+                .run_if(not(resource_exists::<Initializing>))
+                .run_if(on_timer(CLOSED_WINDOW_CHECK_FREQ)),
+            systems::auto_discover_unmanaged_focused_windows,
             systems::retry_front_switch,
             systems::update_low_power_state
                 .run_if(resource_exists::<LowPowerMode>)
-                .run_if(on_timer(Duration::from_secs(LOW_POWER_MODE_CHECK_SEC))),
+                .run_if(on_timer(LOW_POWER_MODE_CHECK)),
             (
                 systems::window_resized_update_frame,
                 systems::window_moved_update_frame,
@@ -178,7 +202,8 @@ pub fn register_systems(app: &mut bevy::app::App) {
                 systems::update_flash_messages,
             )
                 .chain(),
-            crate::menubar::update_menu_bar.run_if(vw_indicator_dirty),
+            crate::menubar::update_menu_bar
+                .run_if(vw_indicator_dirty.or_eager(strip_count_changed)),
             systems::reap_stale_strip_windows.run_if(not(resource_exists::<Initializing>)),
         ),
     );
@@ -255,7 +280,34 @@ pub struct ReshuffleAroundMarker;
 /// alone and the entity is free to slide there. Only when the new slot would
 /// fall off the edge does the strip scroll just enough to expose it.
 #[derive(Component)]
-pub struct EnsureVisibleMarker;
+pub struct EnsureVisibleMarker {
+    /// Assign the corrected scroll directly instead of animating toward it.
+    /// Needed for the one-tick-delayed correction issued after a virtual
+    /// workspace restore (`show_active_workspace`): its own `ensure_visible`
+    /// call is skipped on the activation tick by
+    /// `ensure_visible_in_strip`'s `is_added(ActiveWorkspaceMarker)` guard,
+    /// so by the time it actually runs (the next tick), it has no way to
+    /// tell this apart from an ordinary reshuffle-driven correction — which
+    /// must keep animating regardless of `virtual_workspace_animations`.
+    /// `false` for every other caller, which should keep animating.
+    pub snap: bool,
+}
+
+/// Marks a [`LayoutStrip`](crate::ecs::layout::LayoutStrip) whose offset was
+/// placed deliberately by the user (`Operation::Center`, `Operation::Snap`)
+/// rather than derived from a window frame. While it is present and still
+/// current, `reshuffle_layout_strip` leaves the offset alone — edge invariant
+/// included — for any window that is already fully visible.
+///
+/// Currency is a value comparison, not change detection: the animator writes
+/// `Position` every frame and `layout_sizes_changed` turns that into a
+/// `LayoutStrip` change, so a tick would go stale immediately. `signature`
+/// holds the ordered column tops with their target widths, which survives
+/// scrolling and tab reordering but not an add, remove, reorder or resize.
+#[derive(Component, Debug)]
+pub struct ManualStripOffset {
+    pub signature: Vec<(Entity, i32)>,
+}
 
 /// Set on a layout strip when a swipe has stopped moving it, recording when
 /// that happened. The snap-into-view only fires once the strip has stayed
@@ -334,6 +386,10 @@ pub struct Timeout {
     pub timer: Timer,
     /// An optional system to execute on timeout.
     pub system_id: Option<SystemId>,
+    /// Optional custom expiry action. When `None`, the owning entity is
+    /// despawned on timeout; when `Some`, the callback runs on the entity
+    /// (e.g. removing temporary marker components without despawning the entity).
+    pub on_expire: Option<fn(&mut EntityCommands)>,
 }
 
 impl Timeout {
@@ -349,28 +405,40 @@ impl Timeout {
     ///
     /// A new `Timeout` instance.
     pub fn new(duration: Duration, message: Option<String>, commands: &mut Commands) -> Self {
-        let timer = Timer::from_seconds(duration.as_secs_f32(), bevy::time::TimerMode::Once);
-        if let Some(message) = message {
-            let callback = move || {
+        let timer = Timer::new(duration, bevy::time::TimerMode::Once);
+        let system_id = message.map(|message| {
+            commands.register_system(move || {
                 tracing::debug!("{message}");
-            };
-            let system_id = Some(commands.register_system(callback));
+            })
+        });
+        Self {
+            timer,
+            system_id,
+            on_expire: None,
+        }
+    }
 
-            Self { timer, system_id }
-        } else {
-            Self {
-                timer,
-                system_id: None,
-            }
+    /// Creates a timeout attached to an existing entity that removes `Timeout`
+    /// and `C` when the timer expires instead of despawning the entity.
+    #[must_use]
+    pub fn for_component<C: Component>(duration: Duration) -> Self {
+        let timer = Timer::new(duration, bevy::time::TimerMode::Once);
+        Self {
+            timer,
+            system_id: None,
+            on_expire: Some(|entity_commands| {
+                entity_commands.try_remove::<(Self, C)>();
+            }),
         }
     }
 
     /// Creates an action timeout, which oneshots a provided system id.
     pub fn callback(duration: Duration, system_id: SystemId, commands: &mut Commands) {
-        let timer = Timer::from_seconds(duration.as_secs_f32(), bevy::time::TimerMode::Once);
+        let timer = Timer::new(duration, bevy::time::TimerMode::Once);
         commands.spawn(Self {
             timer,
             system_id: Some(system_id),
+            on_expire: None,
         });
     }
 }
@@ -384,6 +452,12 @@ pub struct StrayFocusEvent(pub WinID);
 #[derive(Component)]
 pub struct RetryFrontSwitch(pub Entity);
 
+/// Marker component attached to a window after a keyboard focus request to
+/// verify whether the application accepted or rejected focus once the settle
+/// [`Timeout`] completes.
+#[derive(Component)]
+pub struct VerifyFocus;
+
 #[derive(Component)]
 pub struct BruteforceWindows(Task<Vec<Window>>);
 
@@ -393,22 +467,6 @@ pub enum DockPosition {
     Left(i32),
     Right(i32),
     Hidden,
-}
-
-#[derive(Component)]
-pub struct RefreshWindowSizes(pub Instant);
-
-impl Default for RefreshWindowSizes {
-    fn default() -> Self {
-        Self(Instant::now())
-    }
-}
-
-impl RefreshWindowSizes {
-    pub fn ready(&self) -> bool {
-        const REFRESH_WINDOW_SIZE_DELAY_SEC: u64 = 5;
-        self.0.elapsed() > Duration::from_secs(REFRESH_WINDOW_SIZE_DELAY_SEC)
-    }
 }
 
 #[derive(Component)]
@@ -485,6 +543,12 @@ pub trait SpawnCommandsExt {
 
     fn ensure_visible(&mut self, entity: Entity);
 
+    /// Like [`SpawnCommandsExt::ensure_visible`], but `snap` controls whether
+    /// `ensure_visible_in_strip`'s correction is animated or assigned
+    /// directly. Only `show_active_workspace` needs this — everyone else
+    /// wants the correction to keep animating.
+    fn ensure_visible_snap(&mut self, entity: Entity, snap: bool);
+
     fn focus_entity(&mut self, entity: Entity, raise: bool);
 
     fn flash_message(&mut self, message: String, duration: f32);
@@ -526,8 +590,13 @@ impl SpawnCommandsExt for Commands<'_, '_> {
 
     #[instrument(level = Level::TRACE, skip(self))]
     fn ensure_visible(&mut self, entity: Entity) {
+        self.ensure_visible_snap(entity, false);
+    }
+
+    #[instrument(level = Level::TRACE, skip(self))]
+    fn ensure_visible_snap(&mut self, entity: Entity, snap: bool) {
         if let Ok(mut entity_commands) = self.get_entity(entity) {
-            entity_commands.try_insert(EnsureVisibleMarker);
+            entity_commands.try_insert(EnsureVisibleMarker { snap });
         }
     }
 
@@ -593,7 +662,40 @@ pub(crate) fn rewatch_configs(
     Some(watcher)
 }
 
+/// Runs the Bevy schedule loop with each tick wrapped in an Objective-C
+/// `NSAutoreleasePool`.
+///
+/// `MinimalPlugins`'s default `ScheduleRunnerPlugin` runs `app.update()` in a
+/// bare Rust loop with no pool. While `pump_cocoa_event_loop` wraps
+/// `nextEventMatchingMask` in its own pool, every Bevy system in `Startup`,
+/// `PreUpdate` (after the pump), `Update`, and `PostUpdate` (`OverlayManager`,
+/// `FlashMessageManager`, `MenuBarManager`, `NSScreen`, `NSWorkspace`,
+/// `CoreAnimation` `CATransaction`s) runs outside that pool and would otherwise
+/// push autoreleased objects into the root pool for the lifetime of the daemon.
+fn autorelease_runner(mut app: BevyApp) -> bevy::app::AppExit {
+    if app.plugins_state() != bevy::app::PluginsState::Cleaned {
+        while app.plugins_state() == bevy::app::PluginsState::Adding {
+            bevy::tasks::tick_global_task_pools_on_main_thread();
+        }
+        objc2::rc::autoreleasepool(|_| {
+            app.finish();
+            app.cleanup();
+        });
+    }
+
+    loop {
+        objc2::rc::autoreleasepool(|_| {
+            app.update();
+        });
+        if let Some(exit) = app.should_exit() {
+            return exit;
+        }
+    }
+}
+
 pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<BevyApp> {
+    crate::manager::app::bound_ax_messaging_timeout()?;
+
     let window_manager: Box<dyn WindowManagerApi> = Box::new(WindowManagerOS::new(sender.clone()));
 
     // Discover (or create) the Lua init script first: whether it exists decides
@@ -674,6 +776,8 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
         });
     }
 
+    app.set_runner(autorelease_runner);
+
     let menu_events = sender.clone();
     let mut platform_callbacks = PlatformCallbacks::new(sender);
     platform_callbacks.setup_handlers()?;
@@ -686,6 +790,14 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
         .insert_non_send(flash_message_manager)
         .insert_non_send(menu_bar_manager)
         .insert_non_send(receiver);
+
+    // `CONFIGURATION_FILE` is `None` exactly when an `init.lua` took the TOML
+    // file out of play, so copied rules have to be written in Lua instead.
+    app.insert_resource(if CONFIGURATION_FILE.is_none() {
+        SnippetDialect::Lua
+    } else {
+        SnippetDialect::Toml
+    });
 
     if let Some(previous_state) =
         PaneruState::load_from_file(&PaneruState::default_state_file_path())
@@ -779,8 +891,18 @@ impl WindowProperties {
             .collect::<Vec<_>>()
     }
 
-    pub fn width_ratio(&self) -> Option<f64> {
-        self.params.iter().find_map(|props| props.width)
+    pub fn width_ratio(&self, focused_ratio: Option<f64>) -> Option<f64> {
+        self.params
+            .iter()
+            .find_map(|props| props.width)
+            .map(|width| width.ratio(focused_ratio))
+    }
+
+    pub fn fixed_width_ratio(&self) -> Option<f64> {
+        match self.params.iter().find_map(|props| props.width) {
+            Some(InitialWindowWidth::Ratio(ratio)) => Some(ratio),
+            _ => None,
+        }
     }
 
     pub fn vertical_padding(&self) -> i32 {

@@ -2375,3 +2375,629 @@ fn test_front_switch_spawns_missing_app_windows() {
         })
         .run(commands);
 }
+
+/// Focusing an unknown window (e.g. clicking an unmanaged tab or window)
+/// must trigger auto-discovery and manage it on the fly into ECS.
+#[test]
+fn test_auto_discover_unmanaged_focused_window() {
+    let events = vec![
+        // Iteration 0: Boot with 1 managed window (window 0).
+        Event::Command {
+            command: Command::PrintState,
+        },
+        // Iteration 1: Send focus event for unmanaged window 1.
+        Event::WindowFocused { window_id: 1 },
+    ];
+
+    TestHarness::new()
+        .with_windows(1)
+        .on_iteration(0, |world, state| {
+            // Verify window 1 is not in ECS yet.
+            let mut query = world.query::<&crate::manager::Window>();
+            let is_managed = query.iter(world).any(|w| w.id() == 1);
+            assert!(!is_managed, "Window 1 should not be managed yet");
+
+            // Spawn window 1 in mock state without sending AX notification to Paneru (unmanaged tab).
+            state.spawn_window(
+                TEST_PROCESS_ID,
+                TEST_WORKSPACE_ID,
+                1,
+                bevy::math::IRect::from_corners(
+                    bevy::math::IVec2::new(0, 0),
+                    bevy::math::IVec2::new(400, 400),
+                ),
+            );
+            state.focus_window(1);
+        })
+        .on_iteration(1, |world, _state| {
+            // Verify window 1 is now auto-discovered and managed in ECS.
+            let mut query = world.query::<&crate::manager::Window>();
+            let is_managed = query.iter(world).any(|w| w.id() == 1);
+            assert!(
+                is_managed,
+                "Window 1 should be auto-discovered and managed in ECS after receiving focus"
+            );
+        })
+        .run(events);
+}
+
+/// The centering config the manual-offset tests share: `auto_center` off and
+/// `continuous_swipe` off is the combination that arms the edge invariant in
+/// `reshuffle_layout_strip`, which is what used to snap a centered strip back
+/// to the display's left edge.
+fn manual_offset_config() -> Config {
+    (
+        MainOptions {
+            auto_center: Some(false),
+            continuous_swipe: Some(false),
+            animation_speed: Some(10000.0),
+            swipe_gesture_fingers: Some(3),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into()
+}
+
+/// Where window 0 sits once `Operation::Center` has placed it.
+const CENTERED_X: i32 = (TEST_DISPLAY_WIDTH - TEST_WINDOW_WIDTH) / 2;
+
+fn active_strip_entity(world: &mut World) -> Entity {
+    let mut query =
+        world.query_filtered::<Entity, (With<LayoutStrip>, With<ActiveWorkspaceMarker>)>();
+    query.single(world).expect("exactly one active strip")
+}
+
+fn has_manual_offset(world: &mut World) -> bool {
+    let entity = active_strip_entity(world);
+    world.get::<ManualStripOffset>(entity).is_some()
+}
+
+fn window_x(world: &mut World, id: WinID) -> i32 {
+    let mut query = world.query::<&Window>();
+    query
+        .iter(world)
+        .find(|window| window.id() == id)
+        .expect("window not found")
+        .frame()
+        .min
+        .x
+}
+
+/// A repeated OS focus event for the window that already holds focus — what a
+/// browser emits when a new tab opens — is not new layout information. It used
+/// to run a full reshuffle, which re-derived the strip offset and threw away a
+/// manual centering.
+#[test]
+fn test_center_survives_repeated_focus_event() {
+    let commands = vec![
+        // 0: boot with focus on window 0.
+        Event::MenuOpened { window_id: 0 },
+        // 1: center it.
+        Event::Command {
+            command: Command::Window(Operation::Center),
+        },
+        // 2: the repeated focus event queued below plays out here.
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_config(manual_offset_config())
+        .with_windows(5)
+        .on_iteration(1, |world, state| {
+            assert_eq!(window_x(world, 0), CENTERED_X, "window 0 must be centered");
+            // The app re-announces the window that already holds focus.
+            state.focus_window(0);
+        })
+        .on_iteration(2, |world, _state| {
+            assert_eq!(
+                window_x(world, 0),
+                CENTERED_X,
+                "a repeated focus event must not undo the centering"
+            );
+            assert!(
+                has_manual_offset(world),
+                "the manual offset must survive a repeated focus event"
+            );
+        })
+        .run(commands);
+}
+
+/// The offset is only a claim about the layout it was taken on. Adding a window
+/// changes that layout, so the next reshuffle derives a fresh offset and the
+/// strip goes back to the edge invariant.
+#[test]
+fn test_center_dropped_when_window_added() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        // 1: center window 0.
+        Event::Command {
+            command: Command::Window(Operation::Center),
+        },
+        // 2: the sixth window spawned below joins the strip.
+        Event::Command {
+            command: Command::PrintState,
+        },
+        // 3: a focus change asks for a reshuffle on the new layout.
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::East)),
+        },
+    ];
+
+    TestHarness::new()
+        .with_config(manual_offset_config())
+        .with_windows(5)
+        .on_iteration(1, |world, state| {
+            assert_eq!(window_x(world, 0), CENTERED_X, "window 0 must be centered");
+
+            let window = state.spawn_window(
+                TEST_PROCESS_ID,
+                TEST_WORKSPACE_ID,
+                5,
+                IRect::new(0, 0, TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT),
+            );
+            world.trigger(SpawnWindowTrigger(vec![window]));
+        })
+        .on_iteration(3, |world, _state| {
+            assert_eq!(
+                window_x(world, 0),
+                0,
+                "a reshuffle on a changed layout must re-derive the offset"
+            );
+            assert!(
+                !has_manual_offset(world),
+                "adding a window must invalidate the manual offset"
+            );
+        })
+        .run(commands);
+}
+
+/// Skipping the reshuffle must not strand a window off-screen: if the strip has
+/// scrolled the focused window past an edge, a focus event still has to bring
+/// it back — and the manual placement it contradicts is dropped with it.
+#[test]
+fn test_partly_hidden_window_still_scrolled_into_view_after_center() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        // 1: center window 0.
+        Event::Command {
+            command: Command::Window(Operation::Center),
+        },
+        // 2: the strip is dragged left below, hiding half of window 0.
+        Event::Command {
+            command: Command::PrintState,
+        },
+        // 3: the focus event queued below plays out here.
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_config(manual_offset_config())
+        .with_windows(5)
+        .on_iteration(1, |world, _state| {
+            assert_eq!(window_x(world, 0), CENTERED_X, "window 0 must be centered");
+
+            // Push the strip a full window width further left than the
+            // centering did, which drags window 0 off the left edge.
+            let strip_entity = active_strip_entity(world);
+            let displaced = {
+                let position = world.get::<Position>(strip_entity).expect("strip position");
+                Origin::new(position.0.x - TEST_WINDOW_WIDTH, position.0.y)
+            };
+            world.entity_mut(strip_entity).insert(Position(displaced));
+        })
+        .on_iteration(2, |_world, state| {
+            state.focus_window(0);
+        })
+        .on_iteration(3, |world, _state| {
+            assert!(
+                window_x(world, 0) >= 0,
+                "a window scrolled off the left edge must be brought back into view, got {}",
+                window_x(world, 0)
+            );
+            assert!(
+                !has_manual_offset(world),
+                "a manual offset that hides its own window is stale"
+            );
+        })
+        .run(commands);
+}
+
+/// Switching virtual workspaces re-places the strip from its saved origin, so
+/// the manual claim on the old offset goes away with the switch.
+#[test]
+fn test_center_dropped_on_virtual_workspace_switch() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        // 1: center window 0.
+        Event::Command {
+            command: Command::Window(Operation::Center),
+        },
+        // 2: move a window to VW1 and follow it there.
+        Event::Command {
+            command: Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Follow)),
+        },
+        // 3: back to VW0.
+        Event::Command {
+            command: Command::Window(Operation::VirtualNumber(0)),
+        },
+    ];
+
+    TestHarness::new()
+        .with_config(manual_offset_config())
+        .with_windows(5)
+        .on_iteration(1, |world, _state| {
+            assert!(has_manual_offset(world), "center must mark the strip");
+        })
+        .on_iteration(3, |world, _state| {
+            assert!(
+                !has_manual_offset(world),
+                "a workspace switch must invalidate the manual offset"
+            );
+        })
+        .run(commands);
+}
+
+/// Once the user drives the strip by hand, the earlier placement no longer
+/// describes where they want it.
+#[test]
+fn test_center_dropped_on_user_swipe() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        // 1: center window 0.
+        Event::Command {
+            command: Command::Window(Operation::Center),
+        },
+        // 2: the user swipes the strip.
+        Event::Swipe {
+            delta: -0.2,
+            fingers: 3,
+        },
+    ];
+
+    TestHarness::new()
+        .with_config(manual_offset_config())
+        .with_windows(5)
+        .on_iteration(1, |world, _state| {
+            assert!(has_manual_offset(world), "center must mark the strip");
+        })
+        .on_iteration(2, |world, _state| {
+            assert!(
+                !has_manual_offset(world),
+                "a user swipe must invalidate the manual offset"
+            );
+        })
+        .run(commands);
+}
+
+/// Cmd-Tab into an app parked on another virtual workspace must land focus on
+/// that app's window. Regression: with `virtual_workspace_animations = true`,
+/// the animated branch of `show_active_workspace` restored the strip's
+/// remembered focus unconditionally, so activating the strip through a focus
+/// event immediately yanked focus onto whatever was focused there last.
+#[test]
+fn test_focus_into_hidden_virtual_workspace_keeps_target_window() {
+    let config: Config = (
+        MainOptions {
+            animation_speed: Some(30.0),
+            virtual_workspace_animations: Some(true),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+
+    let commands = vec![
+        // 0: boot.
+        Event::MenuOpened { window_id: 0 },
+        // 1: window 2 takes focus.
+        Event::Command {
+            command: Command::PrintState,
+        },
+        // 2: park it on VW1.
+        Event::Command {
+            command: Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Stay)),
+        },
+        // 3: window 3 takes focus.
+        Event::Command {
+            command: Command::PrintState,
+        },
+        // 4: park it on VW1 too, leaving VW1 = [2, 3].
+        Event::Command {
+            command: Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Stay)),
+        },
+        // 5: visit VW1.
+        Event::Command {
+            command: Command::Window(Operation::VirtualNumber(1)),
+        },
+        // 6: focus window 3 there, so that is what VW1 remembers.
+        Event::Command {
+            command: Command::PrintState,
+        },
+        // 7: back to VW0, parking VW1.
+        Event::Command {
+            command: Command::Window(Operation::VirtualNumber(0)),
+        },
+        // 8: the Cmd-Tab into window 2 queued below plays out here.
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(4)
+        .on_iteration(0, |_world, state| {
+            state.focus_window(2);
+        })
+        .on_iteration(1, |world, _state| {
+            assert_focused!(world, 2);
+        })
+        .on_iteration(2, |_world, state| {
+            state.focus_window(3);
+        })
+        .on_iteration(3, |world, _state| {
+            assert_focused!(world, 3);
+        })
+        .on_iteration(5, |_world, state| {
+            state.focus_window(3);
+        })
+        .on_iteration(6, |world, _state| {
+            assert_focused!(world, 3);
+        })
+        .on_iteration(7, |_world, state| {
+            // Cmd-Tab straight into window 2, the other window on VW1.
+            state.focus_window(2);
+        })
+        .on_iteration(8, |world, _state| {
+            assert_focused!(world, 2);
+        })
+        .run(commands);
+}
+
+/// Cmd-Tab into a window left hanging off the edge of a hidden virtual
+/// workspace must scroll that workspace's strip far enough to show all of it.
+/// Regression: `show_active_workspace` restored the strip to the offset it had
+/// when it was parked, which says nothing about the window that just took
+/// focus, and `window_hidden_ratio` lets the reshuffle leave a window that far
+/// over an edge alone - so nothing brought it back.
+#[test]
+fn test_focus_into_hidden_virtual_workspace_exposes_target_window() {
+    /// How far window 2 hangs off the left edge while VW1 is parked: a
+    /// quarter of it, which `window_hidden_ratio` below tolerates.
+    const OVERHANG: i32 = TEST_WINDOW_WIDTH / 4;
+
+    let config: Config = (
+        MainOptions {
+            animation_speed: Some(10000.0),
+            virtual_workspace_animations: Some(true),
+            auto_center: Some(false),
+            // A reshuffle may leave a window up to half hidden where it is,
+            // so exposing this one is down to the workspace restore itself.
+            window_hidden_ratio: Some(0.5),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+
+    // Park windows 2 to 5 on VW1: four 400px columns on a 1024px display, so
+    // the strip is wider than the screen and has somewhere to scroll to.
+    let mut commands = vec![Event::MenuOpened { window_id: 0 }];
+    for _ in 0..4 {
+        commands.push(Event::Command {
+            command: Command::PrintState,
+        });
+        commands.push(Event::Command {
+            command: Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Stay)),
+        });
+    }
+    commands.extend([
+        // 9: visit VW1.
+        Event::Command {
+            command: Command::Window(Operation::VirtualNumber(1)),
+        },
+        // 10: the strip is dragged left below, leaving window 2 hanging off.
+        Event::Command {
+            command: Command::PrintState,
+        },
+        // 11: park VW1 at that offset.
+        Event::Command {
+            command: Command::Window(Operation::VirtualNumber(0)),
+        },
+        // 12: the Cmd-Tab into window 2 queued below plays out here.
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ]);
+
+    let focus_next = |id: WinID| move |_world: &mut World, state: MockState| state.focus_window(id);
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(6)
+        .on_iteration(0, focus_next(2))
+        .on_iteration(2, focus_next(3))
+        .on_iteration(4, focus_next(4))
+        .on_iteration(6, focus_next(5))
+        .on_iteration(8, focus_next(5))
+        .on_iteration(9, move |world, _state| {
+            // Slide VW1 so window 2 hangs off the left edge by a quarter.
+            let strip_entity = active_strip_entity(world);
+            world
+                .entity_mut(strip_entity)
+                .insert(Position(Origin::new(-OVERHANG, TEST_MENUBAR_HEIGHT)));
+        })
+        .on_iteration(10, move |world, _state| {
+            assert_eq!(
+                window_x(world, 2),
+                -OVERHANG,
+                "test setup: window 2 must hang off the left edge before parking"
+            );
+        })
+        // Cmd-Tab straight into window 2, now that VW1 is parked.
+        .on_iteration(11, focus_next(2))
+        .on_iteration(12, |world, _state| {
+            assert_focused!(world, 2);
+            assert_eq!(
+                window_x(world, 2),
+                0,
+                "the workspace restore must show all of the window it was activated for"
+            );
+        })
+        .run(commands);
+}
+
+/// Invoking `Operation::CopyRule` copies a valid window rule snippet
+/// for the focused window to the clipboard.
+#[test]
+fn test_copy_window_rule_command() {
+    let commands = vec![
+        // 0: boot with focus on window 0.
+        Event::MenuOpened { window_id: 0 },
+        // 1: copy window rule for the focused window.
+        Event::Command {
+            command: Command::Window(Operation::CopyRule),
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(1)
+        .on_iteration(1, |_world, _state| {
+            let copied = crate::pasteboard::get_test_clipboard()
+                .expect("clipboard should have been populated");
+            assert!(
+                copied.contains("[windows.testapp]") || copied.contains("windows = {"),
+                "copied snippet should contain window rule, got: {copied}"
+            );
+            assert!(
+                copied.contains("bundle_id = \"test\""),
+                "copied snippet should contain bundle id, got: {copied}"
+            );
+            assert!(
+                copied.contains("title = \"^Window 0$\""),
+                "copied snippet should contain exact anchored window title, got: {copied}"
+            );
+        })
+        .run(commands);
+}
+
+/// `virtualnum` on a missing row spawns it — row 0 included. Row 0 used to be
+/// the one index that bailed out instead, so a space that had lost its row 0
+/// could never switch back to workspace "1".
+#[test]
+fn test_virtual_number_recreates_missing_baseline_row() {
+    let mut h = TestHarness::new().with_windows(2);
+    let pump = |h: &mut TestHarness, c: Command| {
+        h.app
+            .world_mut()
+            .write_message::<Event>(Event::Command { command: c });
+        for _ in 0..8 {
+            h.app.update();
+            for e in h.mock_state.drain_events() {
+                h.app.world_mut().write_message::<Event>(e);
+            }
+        }
+    };
+
+    // Move both windows onto row 1 and switch there, then drop row 0 the way a
+    // display change does, leaving the space numbered from "2".
+    for _ in 0..2 {
+        pump(
+            &mut h,
+            Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Follow)),
+        );
+    }
+    let world = h.world();
+    let row_zero = world
+        .query::<(Entity, &LayoutStrip)>()
+        .iter(world)
+        .find(|(_, strip)| strip.virtual_index == 0)
+        .map(|(entity, _)| entity)
+        .expect("row 0 should still exist before it is dropped");
+    world.entity_mut(row_zero).despawn();
+
+    let world = h.world();
+    let indexes = world
+        .query::<&LayoutStrip>()
+        .iter(world)
+        .map(|strip| strip.virtual_index)
+        .collect::<Vec<_>>();
+    assert_eq!(indexes, vec![1], "only row 1 should be left");
+
+    pump(&mut h, Command::Window(Operation::VirtualNumber(0)));
+
+    let world = h.world();
+    let recreated = world
+        .query::<(&LayoutStrip, Has<ActiveWorkspaceMarker>)>()
+        .iter(world)
+        .filter(|(strip, _)| strip.virtual_index == 0)
+        .map(|(_, active)| active)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        recreated,
+        vec![true],
+        "virtualnum 0 should recreate row 0 and make it active"
+    );
+}
+
+/// Moving a window to a missing row spawns it — row 0 included. Row 0 used to
+/// be refused here too, so a space that had lost its row 0 could not even send
+/// a window back to workspace "1".
+#[test]
+fn test_virtual_move_number_recreates_missing_baseline_row() {
+    let mut h = TestHarness::new().with_windows(2);
+    let pump = |h: &mut TestHarness, c: Command| {
+        h.app
+            .world_mut()
+            .write_message::<Event>(Event::Command { command: c });
+        for _ in 0..8 {
+            h.app.update();
+            for e in h.mock_state.drain_events() {
+                h.app.world_mut().write_message::<Event>(e);
+            }
+        }
+    };
+
+    // Park both windows on row 1 and drop the emptied row 0 the way a display
+    // change does, leaving the space numbered from "2".
+    for _ in 0..2 {
+        pump(
+            &mut h,
+            Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Follow)),
+        );
+    }
+    let world = h.world();
+    let row_zero = world
+        .query::<(Entity, &LayoutStrip)>()
+        .iter(world)
+        .find(|(_, strip)| strip.virtual_index == 0)
+        .map(|(entity, _)| entity)
+        .expect("row 0 should still exist before it is dropped");
+    world.entity_mut(row_zero).despawn();
+
+    pump(
+        &mut h,
+        Command::Window(Operation::VirtualMoveNumber(0, MoveFocus::Follow)),
+    );
+
+    let world = h.world();
+    let focused = world
+        .query_filtered::<Entity, With<FocusedMarker>>()
+        .single(world)
+        .expect("the followed window should be focused");
+    let recreated = world
+        .query::<&LayoutStrip>()
+        .iter(world)
+        .filter(|strip| strip.virtual_index == 0)
+        .map(|strip| strip.contains(focused))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        recreated,
+        vec![true],
+        "the moved window should land on a single recreated row 0"
+    );
+}

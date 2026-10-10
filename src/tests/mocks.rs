@@ -88,6 +88,10 @@ struct MockStateInner {
     /// Windows that are gone but which the app's AX window list still reports,
     /// modelling the lag real apps show right after a window closes.
     stale_window_ids: HashMap<WinID, Pid>,
+    unordered_windows: HashSet<WinID>,
+    /// Windows the app keeps out of its accessibility window list while the
+    /// window server still reports them on screen: a background native tab.
+    background_tabs: HashSet<WinID>,
 }
 
 #[derive(Clone)]
@@ -107,7 +111,32 @@ impl MockState {
                 cursor_position: Origin::ZERO,
                 event_queue: VecDeque::new(),
                 stale_window_ids: HashMap::new(),
+                unordered_windows: HashSet::new(),
+                background_tabs: HashSet::new(),
             })),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn set_window_unordered(&self, window_id: WinID, unordered: bool) {
+        let mut inner = self.inner.force_write();
+        if unordered {
+            inner.unordered_windows.insert(window_id);
+        } else {
+            inner.unordered_windows.remove(&window_id);
+        }
+    }
+
+    /// Makes `window_id` a background native tab: on screen as far as the
+    /// window server is concerned, absent from the app's accessibility window
+    /// list. This is what Ghostty does with every tab but the selected one.
+    #[allow(unused)]
+    pub fn set_background_tab(&self, window_id: WinID, background: bool) {
+        let mut inner = self.inner.force_write();
+        if background {
+            inner.background_tabs.insert(window_id);
+        } else {
+            inner.background_tabs.remove(&window_id);
         }
     }
 
@@ -159,6 +188,18 @@ impl MockState {
         self.create_window(id)
     }
 
+    /// Moves the app's focused window without emitting the notifications a
+    /// real focus change would produce.
+    pub fn set_focused_window(&self, id: WinID) {
+        let mut inner = self.inner.force_write();
+        let Some(pid) = inner.windows.get(&id).map(|window| window.pid) else {
+            return;
+        };
+        if let Some(app) = inner.apps.get_mut(&pid) {
+            app.focused_window_id = Some(id);
+        }
+    }
+
     pub fn focus_window(&self, id: WinID) {
         let mut inner = self.inner.force_write();
         if let Some(win) = inner.windows.get(&id) {
@@ -189,6 +230,11 @@ impl MockState {
                 workspaces,
             },
         );
+    }
+
+    pub fn set_display_bounds(&self, id: u32, bounds: IRect) {
+        let mut inner = self.inner.force_write();
+        inner.displays.get_mut(&id).expect("finding display").bounds = bounds;
     }
 
     #[allow(unused)]
@@ -320,7 +366,9 @@ impl MockState {
     /// closed while paneru was not running.
     #[allow(unused)]
     pub fn os_vanish_window(&self, id: WinID) {
-        self.inner.force_write().windows.remove(&id);
+        let mut inner = self.inner.force_write();
+        inner.windows.remove(&id);
+        inner.unordered_windows.insert(id);
     }
 
     /// Lets the app's window list catch up with reality after a close.
@@ -478,12 +526,12 @@ impl MockState {
 
         let s = self.clone();
         mw.expect_role().returning(move || {
-            Ok(s.inner
+            s.inner
                 .force_read()
                 .windows
                 .get(&id)
                 .map(|w| w.role.clone())
-                .unwrap_or_default())
+                .ok_or_else(|| crate::errors::Error::Generic(format!("window {id} not found")))
         });
 
         let s = self.clone();
@@ -546,8 +594,20 @@ impl MockState {
         // Fill in remaining defaults
         mw.expect_element().return_const(None);
         mw.expect_raise_without_focus().return_const(());
-        mw.expect_focus_without_raise().return_const(());
         mw.expect_release_ax_lock().times(0..).return_const(());
+
+        // Focusing without raising still moves the OS focus, it just leaves the
+        // window order alone. Only the app's idea of its focused window changes
+        // here: the notification that follows in the real thing is what
+        // `focus_window` models, and callers of this already act on their own
+        // request. Dropping even this much left the app reporting the previous
+        // window, which made `window_focused_trigger` discard events for the
+        // window that had actually been focused.
+        let s = self.clone();
+        mw.expect_focus_without_raise()
+            .returning(move |_psn, _focused, _focused_psn| {
+                s.set_focused_window(id);
+            });
         mw.expect_set_padding().return_const(());
 
         Window::new(Box::new(mw))
@@ -569,6 +629,17 @@ impl MockState {
                 .get(&pid)
                 .and_then(|a| a.focused_window_id)
                 .ok_or(Error::InvalidWindow)
+        });
+
+        let s = self.clone();
+        ma.expect_focused_window().returning(move |_config| {
+            let inner = s.inner.force_read();
+            let focused_id = inner.apps.get(&pid).and_then(|a| a.focused_window_id)?;
+            if inner.windows.contains_key(&focused_id) {
+                Some(s.create_window(focused_id))
+            } else {
+                None
+            }
         });
 
         let s = self.clone();
@@ -632,11 +703,27 @@ impl MockState {
         ma.expect_window_list()
             .returning(move |_| ids().into_iter().map(|id| s.create_window(id)).collect());
 
+        let (s, ids) = (self.clone(), window_ids.clone());
+        ma.expect_ax_window_ids().returning(move || {
+            let background = s.inner.force_read().background_tabs.clone();
+            ids()
+                .into_iter()
+                .filter(|id| !background.contains(id))
+                .collect()
+        });
+
         Application::new(Box::new(ma))
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn create_window_manager(&self) -> MockWindowManagerApi {
         let mut wm = MockWindowManagerApi::new();
+
+        let s = self.clone();
+        wm.expect_window_is_unordered().returning(move |window_id| {
+            let inner = s.inner.force_read();
+            inner.unordered_windows.contains(&window_id) || !inner.windows.contains_key(&window_id)
+        });
 
         let s = self.clone();
         wm.expect_active_display_id()

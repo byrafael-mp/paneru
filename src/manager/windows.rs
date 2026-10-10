@@ -403,7 +403,7 @@ impl WindowOS {
                 NonNull::from(&mut point).as_ptr().cast(),
             )
         };
-        if let Ok(position) = AXUIWrapper::retain(position_ref) {
+        if let Ok(position) = AXUIWrapper::from_retained(position_ref) {
             unsafe {
                 AXUIElementSetAttributeValue(
                     self.ax_element.as_ptr(),
@@ -430,7 +430,7 @@ impl WindowOS {
                 NonNull::from(&mut cgsize).as_ptr().cast(),
             )
         };
-        if let Ok(size_value) = AXUIWrapper::retain(size_ref) {
+        if let Ok(size_value) = AXUIWrapper::from_retained(size_ref) {
             unsafe {
                 AXUIElementSetAttributeValue(
                     self.ax_element.as_ptr(),
@@ -637,7 +637,7 @@ impl WindowApi for WindowOS {
                 &mut position_ref,
             )
             .to_result(function_name!())?;
-            AXUIWrapper::retain(position_ref)?
+            AXUIWrapper::from_retained(position_ref)?
         };
         let size = unsafe {
             let mut size_ref: *mut CFType = null_mut();
@@ -647,7 +647,7 @@ impl WindowApi for WindowOS {
                 &mut size_ref,
             )
             .to_result(function_name!())?;
-            AXUIWrapper::retain(size_ref)?
+            AXUIWrapper::from_retained(size_ref)?
         };
 
         let mut frame = CGRect::default();

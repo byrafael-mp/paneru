@@ -7,12 +7,12 @@
 //! that can't be resolved is logged at debug and skipped without affecting
 //! the rest.
 
+use crate::types::windowset::LayoutOp;
 use bevy::ecs::entity::Entity;
 use bevy::ecs::message::MessageReader;
 use bevy::ecs::query::{Has, Without};
 use bevy::ecs::system::{Commands, Query};
 use bevy::platform::collections::HashSet;
-use paneru_shared_types::windowset::LayoutOp;
 use tracing::debug;
 
 use crate::commands::{Command, MoveFocus, Operation};
@@ -188,6 +188,22 @@ fn apply(
                         entity_commands.try_insert(WidthRatio(ratio));
                     }
                 }
+            }
+            // A stored ratio does not resize anything by itself: no system
+            // reacts to `WidthRatio` changes, and the next bounds sync
+            // recomputes it from the live frame, discarding the request. The
+            // interactive resize path (`resize_window`, used by the menubar
+            // width picker) does the real work — pixel size, viewport
+            // clamping, stacked siblings, reshuffle — but only for the
+            // focused window, so route through it when we can.
+            if windows
+                .focused()
+                .is_some_and(|(_, focused)| focused == entity)
+            {
+                commands.trigger(SendMessageTrigger(Event::Command {
+                    command: Command::Window(Operation::SetWidth(ratio)),
+                }));
+                return;
             }
             commands.reshuffle_around(entity);
         }

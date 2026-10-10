@@ -5,7 +5,9 @@ use bevy::ecs::lifecycle::{Add, Remove, RemovedComponents};
 use bevy::ecs::message::{MessageReader, MessageWriter};
 use bevy::ecs::observer::On;
 use bevy::ecs::query::{Added, Has, With, Without};
-use bevy::ecs::system::{Commands, NonSend, NonSendMut, Populated, Query, Res, ResMut, Single};
+use bevy::ecs::system::{
+    Commands, NonSend, NonSendMut, ParamSet, Populated, Query, Res, ResMut, Single,
+};
 use bevy::math::IRect;
 use notify::event::{DataChange, MetadataKind, ModifyKind};
 use notify::{EventKind, Watcher};
@@ -41,6 +43,28 @@ use crate::util::{round_px, symlink_target};
 /// give the usable viewport a window has to be fitted into.
 type ActiveDisplayViewport<'w, 's> =
     Single<'w, 's, (&'static Display, Option<&'static DockPosition>), With<ActiveDisplayMarker>>;
+
+type AddedWindowDefaults<'w, 's> = Populated<
+    'w,
+    's,
+    (
+        &'static mut Window,
+        &'static mut Position,
+        &'static mut Bounds,
+        &'static mut WidthRatio,
+        &'static ChildOf,
+    ),
+    Added<Window>,
+>;
+
+type WindowDefaultsQueries<'w, 's> = ParamSet<
+    'w,
+    's,
+    (
+        AddedWindowDefaults<'static, 'static>,
+        Query<'static, 'static, &'static WidthRatio, With<FocusedMarker>>,
+    ),
+>;
 
 /// Computes the passthrough keybinding set for the given window/app and
 /// publishes it to the input thread. Called on focus change and config reload.
@@ -252,6 +276,7 @@ pub(super) fn theme_change_trigger(
 /// * `global_state` - Focus-follows-mouse and reshuffle flags.
 /// * `ctx` - Window queries, configuration and the command buffer.
 #[instrument(level = Level::DEBUG, skip_all)]
+#[allow(clippy::too_many_lines)]
 pub(super) fn window_focused_trigger(
     mut messages: MessageReader<Event>,
     applications: Query<&Application>,
@@ -262,6 +287,12 @@ pub(super) fn window_focused_trigger(
     mut ctx: WindowCtx,
 ) {
     const STRAY_FOCUS_RETRY_SEC: u64 = 2;
+
+    let initial_focused = ctx
+        .windows
+        .focused()
+        .map(|(window, entity)| (entity, window.id()));
+    let mut current_focused = initial_focused;
 
     for event in messages.read() {
         let Event::WindowFocused { window_id } = *event else {
@@ -283,29 +314,45 @@ pub(super) fn window_focused_trigger(
             continue;
         };
 
+        // Guard against stale focus events: a delayed one (from
+        // RetryFrontSwitch or a dont_focus re-assertion) must not pull
+        // FocusedMarker back after focus has moved to another app.
+        if !app.is_frontmost() {
+            continue;
+        }
+
+        // Within the app, the window it says is focused wins over the id the
+        // event carries, which may be a moment out of date. An app with native
+        // tabs in particular answers with whichever member of the tab group it
+        // decided to show. Follow it to that window rather than dropping the
+        // event: dropping it leaves the strip parked where it was, so Cmd-Tab
+        // into a tabbed terminal looks like nothing happened.
+        let (window, entity, window_id) = match app.focused_window_id() {
+            Ok(current) if current != window_id => {
+                match ctx.windows.find_parent(current) {
+                    Some((current_window, current_entity, current_parent))
+                        if current_parent == parent =>
+                    {
+                        debug!(
+                            "app {} reports window {current} focused, not {window_id}; following it",
+                            app.name()
+                        );
+                        (current_window, current_entity, current)
+                    }
+                    // Nothing we track answers to that id, so the event really
+                    // is stale.
+                    _ => continue,
+                }
+            }
+            _ => (window, entity, window_id),
+        };
+
         // Always keep passthrough in sync. An internal focus_entity call races
         // with the OS WindowFocused event; without this the passthrough keys
         // remain stale from a previously focused window.
         update_passthrough(window, app, &ctx.config);
 
-        let already_focused = ctx
-            .windows
-            .focused()
-            .is_some_and(|(focused, _)| focused.id() == window_id);
-
-        // Guard against stale focus events. Without these checks, delayed
-        // events (e.g. from RetryFrontSwitch or dont_focus re-assertions)
-        // can pull FocusedMarker back to an old window after focus has moved on.
-        //
-        // 1. Cross-app: skip if the window's app is no longer frontmost.
-        // 2. Same-app: skip if the app's current focused window differs from
-        //    this event's window_id (the event is outdated).
-        if !app.is_frontmost() {
-            continue;
-        }
-        if app.focused_window_id().is_ok_and(|id| id != window_id) {
-            continue;
-        }
+        let already_focused = current_focused.is_some_and(|(_, id)| id == window_id);
 
         let managed = ctx
             .windows
@@ -380,16 +427,30 @@ pub(super) fn window_focused_trigger(
             if restored_focus {
                 continue;
             }
+            // A repeat focus event for the window that already holds focus (a
+            // new browser tab, an app re-activating) is not new layout
+            // information, so it must not re-derive the strip offset — that
+            // threw away a manual centering. Expose the window if it has been
+            // scrolled off an edge, and otherwise leave the strip alone.
             if !global_state.skip_reshuffle() && !global_state.initializing() {
-                ctx.commands.reshuffle_around(entity);
+                ctx.commands.ensure_visible(entity);
             }
             continue;
         }
 
-        if let Ok(mut entity_commands) = ctx.commands.get_entity(entity) {
-            entity_commands.try_insert(FocusedMarker);
-            debug!("window {} ({entity}) focused.", window.id());
-        }
+        current_focused = Some((entity, window_id));
+    }
+
+    // Apply `FocusedMarker` at most once for the final target in this frame's
+    // batch: queueing `try_insert(FocusedMarker)` for multiple entities in one
+    // deferred command buffer causes `maintain_focus_singleton` to queue
+    // `try_remove::<FocusedMarker>()` on both of them, stripping focus entirely.
+    if let Some((entity, window_id)) = current_focused
+        && current_focused != initial_focused
+        && let Ok(mut entity_commands) = ctx.commands.get_entity(entity)
+    {
+        entity_commands.try_insert(FocusedMarker);
+        debug!("window {window_id} ({entity}) focused.");
     }
 }
 
@@ -814,7 +875,9 @@ pub(super) fn window_managed_trigger(
     {
         let properties = WindowProperties::new(app, window, &ctx.config);
 
-        if let Some(width_ratio) = properties.width_ratio() {
+        // Re-managing an existing window (e.g. after un-floating it) retains
+        // its width under the dynamic rule. Fixed rules keep their old behavior.
+        if let Some(width_ratio) = properties.fixed_width_ratio() {
             let (_, pad_right, _, pad_left) = ctx.config.edge_padding();
             let padded_width = display_bounds.width() - pad_left - pad_right;
             let width = round_px(f64::from(padded_width) * width_ratio);
@@ -989,6 +1052,20 @@ fn give_away_focus(
     config: &mut GlobalState,
     commands: &mut Commands,
 ) {
+    if active_strip.is_tabbed_display(entity)
+        && let Some(sibling) = active_strip.tab_display_sibling(entity)
+    {
+        // Closing/losing focus on the active tab of a paneru-tabbed-display
+        // stack must focus the next tab, not fall through to the
+        // nearest-column search below — that search returns one
+        // representative entity per column, and this column's own entry
+        // was `entity` itself, so it would otherwise jump to an unrelated
+        // neighbouring column.
+        config.set_ffm_flag(None);
+        commands.focus_entity(sibling, true);
+        return;
+    }
+
     if active_strip.tabbed(entity) {
         // Do not give away focus for tabbed windows.
         // Remaining tab gets the focus.
@@ -1099,7 +1176,7 @@ pub(super) fn spawn_window_trigger(
         let title = window.title().unwrap_or_default();
         let app_name = app.name().to_string();
         let bundle_id = app.bundle_id().unwrap_or_default().clone();
-        let window_frame = paneru_shared_types::state::Frame {
+        let window_frame = crate::types::state::Frame {
             x: frame.min.x,
             y: frame.min.y,
             width: frame.width(),
@@ -1135,13 +1212,14 @@ pub(super) fn spawn_window_trigger(
 }
 
 pub(super) fn apply_window_defaults(
-    added: Populated<(&mut Window, &mut Position, &mut Bounds, &ChildOf), Added<Window>>,
+    mut windows: WindowDefaultsQueries,
     apps: Query<(Entity, &Application)>,
     active_display: ActiveDisplay,
     config: Res<Config>,
     initializing: Option<Res<Initializing>>,
 ) {
-    for (ref mut window, mut position, mut bounds, child) in added {
+    let focused_ratio = windows.p1().single().ok().map(|ratio| ratio.0);
+    for (ref mut window, mut position, mut bounds, mut width_ratio, child) in windows.p0() {
         let Ok((_, app)) = apps.get(child.parent()) else {
             continue;
         };
@@ -1169,26 +1247,28 @@ pub(super) fn apply_window_defaults(
         let hpadding = properties.horizontal_padding();
         window.set_padding(WindowPadding::Vertical(vpadding.clamp(0, 50)));
         window.set_padding(WindowPadding::Horizontal(hpadding.clamp(0, 50)));
+        let display_width = f64::from(active_display.bounds().width());
         if let Ok(frame) = window.update_frame() {
             position.0 = frame.min;
-            bounds.0 = frame.size();
+            bounds.bypass_change_detection().0 = frame.size();
+            width_ratio.0 = f64::from(frame.width()) / display_width;
         }
 
         // Apply configured width AFTER update_frame so it isn't overwritten.
-        // Use padded display width (matching window_resize command behavior).
+        // WidthRatio and commit_window_size use the display's raw bounds.
         // Safe during init: this only resizes, it doesn't reposition, so a
         // window on an inactive display stays put.
-        if let Some(width) = properties.width_ratio() {
-            _ = window.update_frame().inspect_err(|err| error!("{err}"));
-            let bounds = active_display.actual_bounds(&config);
-            let (_, pad_right, _, pad_left) = config.edge_padding();
-            let padded_width = bounds.width() - pad_left - pad_right;
-            let new_width = round_px(f64::from(padded_width) * width);
+        if let Some(width) = properties.width_ratio(focused_ratio) {
+            let new_width = round_px(display_width * width);
             let height = window.frame().height();
             window.resize(Size::new(new_width, height));
             // Re-read the actual OS size: the app may enforce a minimum width
             // that differs from our request.
-            _ = window.update_frame().inspect_err(|err| error!("{err}"));
+            if let Ok(frame) = window.update_frame().inspect_err(|err| error!("{err}")) {
+                position.0 = frame.min;
+                bounds.bypass_change_detection().0 = frame.size();
+                width_ratio.0 = f64::from(frame.width()) / display_width;
+            }
         }
     }
 }
@@ -1249,11 +1329,12 @@ pub(super) fn apply_window_positions(
             continue;
         }
 
-        // During startup, the window is already inserted into some strip.
+        // During startup, finish_setup already inserted the window into a strip.
         let allready_inserted = workspaces
             .iter_mut()
             .find_map(|(strip, _)| strip.contains(entity).then_some(strip));
-        if allready_inserted.is_none()
+        if initializing.is_none()
+            && allready_inserted.is_none()
             && let Some(mut strip) = workspaces
                 .iter_mut()
                 .find_map(|(strip, active)| active.then_some(strip))

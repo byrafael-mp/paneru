@@ -35,6 +35,9 @@ https://github.com/user-attachments/assets/793e7eaa-7909-4086-8380-1fb7861f8780
   workspaces to stay organized within each context.
 - **Menu bar workspace indicator:** Shows the currently active virtual
   workspace in the macOS menu bar.
+- **Copy Window Rule:** A menu bar entry that puts a ready-to-paste
+  `[windows]` configuration rule for the focused window on the clipboard, so
+  you never have to guess an app's bundle id.
 - **Startup session restore:** Restores managed window layouts, virtual
   workspaces, and display assignments from the last saved state when Paneru
   starts.
@@ -70,7 +73,8 @@ inspired by [Niri] and [PaperWM.spoon].
 - Like all non-native window managers for MacOS, Paneru requires accessibility
   access to move windows. Once it runs you may get a dialog window asking for
   permissions. Otherwise check the setting in System Settings under "Privacy &
-  Security -> Accessibility".
+  Security -> Accessibility" (or "Privacy & Security -> Device Control and Data
+  Access" on macOS 27 and later).
 
 - Check your System Settings for "Displays have separate spaces" option. It
   should be enabled - this allows Paneru to manage the workspaces independently.
@@ -110,6 +114,18 @@ $ git clone https://github.com/karinushka/paneru.git
 $ cd paneru
 $ cargo build --release
 $ cargo install --path .
+```
+
+By default, Paneru builds with the embedded Lua runtime using a vendored LuaJIT compiled from source, requiring no system-wide Lua installation or `pkg-config` setup.
+
+If you prefer to link against a system- or version-manager-installed Lua (e.g. via `mise`, `asdf`, or Homebrew), disable default features and pass `--features lua`, making sure `PKG_CONFIG_PATH` contains the directory with `luajit.pc`:
+
+```shell
+# When using mise:
+$ PKG_CONFIG_PATH="$(mise where luajit)/lib/pkgconfig:$PKG_CONFIG_PATH" cargo build --release --no-default-features --features lua
+
+# When using Homebrew:
+$ cargo build --release --no-default-features --features lua
 ```
 
 It can run directly from the command line or as a service.
@@ -170,7 +186,10 @@ quit = "ctrl + alt - q"
 
 Alternatively, the embedded Lua runtime can declare the entire configuration
 via `paneru.setup{...}`, making the TOML file optional — see the
-**[Lua Scripting Guide](./SCRIPTING.md)**:
+**[Lua Scripting Guide](./SCRIPTING.md)**.
+
+The `paneru` table is available globally in `init.lua`; `require("paneru")`
+also returns it. No separate `paneru.so` is needed for Paneru's own config.
 
 ```lua
 -- init.lua
@@ -257,6 +276,9 @@ $ paneru send-cmd <command> [args...]
 | `window resize`            | Cycle through `preset_column_widths`             |
 | `window grow`              | Grow to the next preset width                    |
 | `window shrink`            | Shrink to the previous preset width              |
+| `window vertical resize`   | Cycle a stacked window through `preset_stack_heights` |
+| `window vertical grow`     | Grow a stacked window to the next preset height  |
+| `window vertical shrink`   | Shrink a stacked window to the previous preset height |
 | `window fullwidth`         | Toggle full-width mode for the focused window    |
 | `window manage`            | Toggle managed/floating state                    |
 | `window equalize`          | Distribute equal heights in the focused stack    |
@@ -297,6 +319,9 @@ $ paneru send-cmd window balance
 
 # Cycle backward through preset widths.
 $ paneru send-cmd window shrink
+
+# Grow the focused window's height inside its stack.
+$ paneru send-cmd window vertical grow
 
 # Jump to the left-most window.
 $ paneru send-cmd window focus first

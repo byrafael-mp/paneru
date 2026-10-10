@@ -28,16 +28,17 @@ General behavior settings for the window manager.
 | `horizontal_mouse_warp` | Integer ``(-1, 1)`` | Off | If enabled, the mouse will warp to another screen above or below, when touching the left or right edge. The direction depends on the direction - a negative value will cause the left edge to warp to a screen above and the right edge to a screen below. This allows having horizontal positioning of displays while having them aligned in a virtual layout in macOS settings. The cursor lands at the *opposite* edge of the target display (preserving cursor flow), with the source's relative Y position. Carries pre-warp horizontal velocity to avoid a "standing start", and skips the warp when the equivalent Y has no position on the target — matching macOS's native side-by-side behavior for displays of unequal height. (inspired by https://github.com/mogenson/WarpMouse.spoon) |
 | `horizontal_mouse_warp_offset` | Integer (px) | `0` | Vertical pixel offset applied to the `horizontal_mouse_warp` landing position, signed by warp direction. Positive values shift the cursor lower when warping to a display *below* (in macOS arrangement) and higher when warping to one *above*. Use to compensate for physical desk arrangement differing from the macOS arrangement (e.g. portrait monitor sitting physically higher or lower than the laptop). |
 | `preset_column_widths` | Array (Float) | `[0.25, 0.33, 0.5, 0.66, 0.75, 1.0, 1.5, 2.0]` | Ratios of the screen width used by the `window_resize` command and the menu bar width picker. Values above `1.0` create a horizontally scrollable oversized window. |
+| `preset_stack_heights` | Array (Float) | `[0.25, 0.33, 0.5, 0.66, 0.75]` | Ratios of the viewport height used by the `window_vertical_resize` command. Only applies to windows inside a stack; every window in the column is kept at least 200px tall, so a ratio that would starve a neighbour is clamped. |
 | `animation_speed` | Float | *None* | Speed of window animations. Comfortable range is from 8 to 20. Unset or set to a very high value to effectively disable animations. |
 | `auto_center` | Boolean | `false` | Automatically center the focused window on the screen when switching focus. |
 | `sliver_height` | Float (0.1–1.0) | `1.0` | Vertical ratio of off-screen windows kept visible to prevent macOS from relocating them. |
 | `sliver_width` | Integer (px) | `5` | Horizontal width of off-screen windows kept visible. |
 | `menubar_height` | Integer (px) | *Auto* | Manually override the detected macOS menubar height. |
 | `window_hidden_ratio` | Float (0.0–1.0) | `0.0` | How much of a window can be hidden before it's forced into view on focus change. `0.0` = eager, `1.0` = lazy. |
-| `window_resize_cycle` | Boolean | `true` | If disabled, `window_resize` and `window_shrink` stop at the largest/smallest preset instead of cycling back. |
+| `window_resize_cycle` | Boolean | `true` | If disabled, `window_resize` and `window_shrink` (and their `window_vertical_*` counterparts) stop at the largest/smallest preset instead of cycling back. |
 | `mouse_resize_modifier` | String | *None* | If enabled allows window resizing using mouse movement. For example `cmd + shift` will allow resizing of the window when holding those keys. Proximity of the pointer to left or right window edge determines which side will be adjusted. |
 | `reap_empty_workspaces` | String | `false` | If enabled, a virtual workspace without any windows will be removed. |
-| `disable_native_tabs` | Boolean | `false` | If enabled, Paneru will not auto-merge a newly-spawned window into a tab group with an existing same-app sibling that shares its frame. Use this if you find unrelated windows being grouped together. |
+| `disable_native_tabs` | Boolean | `false` | If enabled, Paneru will not auto-merge a window into a tab group with an existing same-app sibling that shares its frame. Merging happens when the window is created, and again for a background tab that the window server stops showing while a sibling of the same app holds the same frame — an app that hides its old tab a moment late would otherwise leave a column nothing can appear in. Use this if you find unrelated windows being grouped together. |
 | `virtual_workspace_animations` | Boolean | `false` | If enabled, Paneru will animate virtual workspace swaps. Off by default, because people use virtual workspaces due to the slow animation of the native macOS workspaces. |
 | `insert_windows_mid_strip` | Boolean | `false` | When moving a window to another virtual workspace, insert it at the column matching its current on-screen position (keeping it where you see it and shifting the rest) instead of appending it to the end of the destination strip. |
 | `create_virtual_workspace_automatically` | Boolean | `false` | Automatically creates a new virtual workspace when using `window_virtual_south `or Southward gesture controls. |
@@ -82,7 +83,20 @@ When `fingers_count` is omitted or set below 3, Paneru does not intercept native
 | Option | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `modifier` | String | `"alt"` | Modifier key(s) required to slide windows with the scroll wheel: `"alt"`, `"rcmd"`, `"ralt + cmd"`, `"lctrl + lalt + cmd"`, etc. |
+| `window_step` | Boolean | `false` | Select one adjacent column per accepted wheel input. This uses the same focus commands as `window_focus_west` and `window_focus_east`. |
 | `vertical_modifier` | String | *None* | Additional modifier key that, when held together with `modifier`, switches virtual workspaces vertically instead of scrolling horizontally. For example, if `modifier = "alt"` and `vertical_modifier = "shift"`, then `alt + scroll` slides windows horizontally and `alt + shift + scroll` switches virtual workspace rows. |
+
+To select windows with Alt + mouse wheel, enable window steps:
+
+```toml
+[swipe.scroll]
+modifier = "alt"
+window_step = true
+```
+
+Window steps use the current focus commands and scroll direction.
+Repeated inputs in the same direction are limited to one step every 180 milliseconds.
+Momentum is ignored. Trackpad gestures and vertical workspace scrolling keep their existing behavior.
 
 ---
 
@@ -102,6 +116,37 @@ Toggles display of the currently active virtual workspace in the menubar or in a
 workspace_menu_status = false
 workspace_popup_status = true
 ```
+
+### `[decorations.menu]`
+
+Basic settings for the menubar display.
+
+| Option | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `orientation` | String | `'default'` | Which of the menubar elements appears first, the descriptor `'default'` or the indicator `'flipped'`. |
+| `colors` | [String] | `['#FFFFFF']` | An array of hex colors defining a linear gradient (left to right) coloring the menubar display. Set a solid color by including only one element. |
+| `angle` | Float | `90.0` | The angle (in degrees) of the gradient. |
+
+### `[decorations.menu.descriptor]`
+Settings for the descriptor component of the menubar display. The descriptor component is a visual marker for the Paneru menubar item.
+| Option | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `style` | String | `'symbol'` | Composition of the descriptor. Options are any SF Symbol `'symbol'`, any string of text `'text'`, both of those `'both'`, or nothing `'hidden'` |
+| `text` | String | `'VW'` | Text shown if `'text'` or `'both'` style is selected. |
+| `symbol` | String | `'fish.fill'` | SF Symbol shown if `'symbol'` or `'both'` style is selected. SF Symbol names can be found in the [SF Symbols App](https://developer.apple.com/sf-symbols/), in the Xcode library, or in a variety of places online. |
+
+### `[decorations.menu.indicator]`
+Settings for the indicator component of the menubar display. The indicator component shows your current (and optionally all active) virtual workspace(s).
+
+**Important Note: The `'unicode'` and `'marked'` formats only mean anything next to the workspaces they are not, so they are incompatible with the single-item `'mono'` and `'paged'` styles and will fall back to `'default'`.**
+
+| Option | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `style` | String | `'mono'` | Whether the indicator displays all virtual workspaces `'multi'`, only your current workspace `'mono'`, or your current workspace over how many there are `'paged'` (`2 / 4`). |
+| `format` | String | `'default'` | The format of the character(s) which represent your virtual workspace(s).<br>Options are regular numbers `'default'`, Roman numerals `'roman'`, any pair of Unicode characters `'unicode'`, or the inactive Unicode character with the active workspace shown as its number `'marked'` (`· 2 · ·`). |
+| `font_size` | Float (2.0 to 24.0) | `13.0` | Font size of the indicator in point. |
+| `active_character` | Char | `'☉'` | The Unicode character which represents an active workspace in the `'unicode'` format. |
+| `inactive_character` | Char | `'○'` | The Unicode character which represents an inactive workspace in the `'unicode'` format. |
 
 
 ### `[decorations.inactive.dim] (Native macOS Dimming)`
@@ -155,10 +200,14 @@ https://github.com/karinushka/paneru/blob/3790b01f8d65df5d9000142db7cf25f9270dcc
 | `window_resize` | Cycle through preset widths (Grow). |
 | `window_grow` | Alias for `window_resize`. |
 | `window_shrink` | Cycle through preset widths (Shrink). |
+| `window_vertical_resize` | Cycle a stacked window through preset heights (Grow). No-op outside a stack. |
+| `window_vertical_grow` | Alias for `window_vertical_resize`. |
+| `window_vertical_shrink` | Cycle a stacked window through preset heights (Shrink). |
 | `window_fullwidth` | Toggle full-width mode. |
 | `window_manage` | Toggle between tiled and floating state. |
 | `window_stack` | Stack the current window into the column on the left. |
 | `window_unstack` | Pull a window out of a stack into its own column. |
+| `window_tabbeddisplay` | Toggle the focused stack between a normal split display and a tabbed display (one window visible at a time, sharing the full column). Cycle tabs with `window_focus_north`/`window_focus_south`. |
 | `window_equalize` | Make all windows in a stack equal height. |
 | `window_balance` | Make all columns in the strip the same width as the focused window. |
 | `window_nextdisplay` | Move focused window to the next monitor and follow it. |
@@ -167,6 +216,7 @@ https://github.com/karinushka/paneru/blob/3790b01f8d65df5d9000142db7cf25f9270dcc
 | `window_snap` | Snap an overflowing window into the viewport. |
 | `window_raise_floating` | Make the floating windows layer visible on the current workspace. |
 | `window_togglefloatlayer` | Selectively move the floating windows in front or behind of the workspace windows. |
+| `window_copyrule` | Copy a window rule template for the focused window to the clipboard. |
 | `quit` | Exit Paneru. |
 | `restart` | Restart the Paneru service (`paneru restart`). |
 
@@ -193,7 +243,8 @@ Virtual workspaces can also be navigated using trackpad gestures. If `[swipe.ges
 
 | Action | Description |
 | :--- | :--- |
-| `window_virtual_north` / `_south` / `_first` / `_last` | Switch to the previous/next or first/last virtual workspace (row of windows). `_east` or `_west` are aliases for `_north` and `_south`. |
+| `window_virtual_north` / `_south` / `_first` / `_last` | Switch to the previous/next or first/last virtual workspace (row of windows), unconditionally. `_east` or `_west` are aliases for `_north` and `_south`. |
+| `window_virtualfocus_north` / `_south` | Like `window_virtual_north`/`_south`, but if the focused window is in a stack and has a neighbor above/below, focuses that neighbor instead of switching — the same within-column traversal as `window_focus_north`/`_south`. Only switches the virtual workspace once there's nothing left to focus that way. No `_east`/`_west`/`_first`/`_last` form (there's no "focus" reading to pair with those). |
 | `window_virtualnum_<number>` | Switch directly to the numbered virtual workspace. |
 | `window_virtualmove_north` / `_south` / `_first` / `_last` | Move currently focused window to the previous/next or first/last virtual workspace and follow it. `_east` or `_west` are aliases for `_north` and `_south`. |
 | `window_virtualsend_north` / `_south` / `_first` / `_last` | Move currently focused window to the previous/next or first/last virtual workspace but stay on the current one. `_east` or `_west` are aliases for `_north` and `_south`. |
@@ -250,11 +301,16 @@ Define specific behaviors for applications based on their Title or Bundle ID.
 | `manage` | Boolean | Force Paneru to manage this app/window even if macOS reports the app as unobservable or the window has a non-standard role/subrole. |
 | `index` | Integer | Preferred position in the strip when spawned. |
 | `dont_focus` | Boolean | Prevent the window from taking focus when spawned. |
-| `width` | Positive Float | Initial width ratio for the window. Values above `1.0` create an oversized, horizontally scrollable window. |
+| `width` | Positive Float or `"complement_focused"` | Initial width ratio for the window. Values above `1.0` create an oversized, horizontally scrollable window. `"complement_focused"` uses `1.0` minus the focused window's width ratio; if there is no focused window or it is at least 95% wide, the new window starts at full width. |
 | `grid` | String | placement for floating windows: `"cols:rows:x:y:w:h"`. |
 | `horizontal_padding` | Integer | Gaps to the left/right of this window. |
 | `vertical_padding` | Integer | Gaps to the top/bottom of this window. |
 | `bindings_passthrough`| Array (String)| Keys that should bypass Paneru and go directly to the app. |
+
+For example, use `width = "complement_focused"` in a window rule to give each
+new window the width remaining beside the currently focused window. A new
+window opened from a full-width window also starts at full width. This width
+is chosen during initial placement, before the `window_spawned` Lua hook runs.
 
 **Example:**
 ```toml
@@ -264,6 +320,32 @@ bundle_id = "com.apple.Terminal"
 horizontal_padding = 5
 bindings_passthrough = ["ctrl-h", "ctrl-l"]
 ```
+
+### Copying a window rule
+
+Neither the bundle ID nor the exact window title is visible anywhere in the UI,
+so the Paneru menu bar has a **Copy Window Rule** entry. You can also trigger it
+via a keybinding (e.g., `window_copyrule = "ctrl + alt - c"`) or run it from the
+command line (`paneru window copyrule`). It puts a rule for the currently focused
+window on the clipboard, ready to paste:
+
+```toml
+[windows.ghostty]
+bundle_id = "com.mitchellh.ghostty"
+title = "^paneru — zsh$"
+# title = ".*"   # all windows of this app
+# app: Ghostty  role: AXWindow  subrole: AXStandardWindow
+# floating = true
+# manage = true
+# width = 0.5
+```
+
+The two matchers are live; everything else is a comment for you to uncomment.
+`title` is anchored and regex-escaped so it matches only this window — swap in
+the commented `.*` to cover every window of the app instead. The `app`, `role`
+and `subrole` line is there to tell one pasted rule from the next; none of those
+are matchable. When an `init.lua` is in charge, the snippet is written as a Lua
+table instead of TOML.
 
 ### Forcing management of LSUIElement or non-standard windows
 

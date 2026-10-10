@@ -1,11 +1,110 @@
+use std::time::Duration;
+
 use crate::commands::{Command, Direction, Operation, ResizeDirection};
-use crate::config::{Config, MainOptions, WindowParams};
+use crate::config::{
+    Config, InitialWindowWidth, InitialWindowWidthMode, MainOptions, WindowParams,
+};
+use crate::ecs::SpawnWindowTrigger;
 use crate::ecs::layout::LayoutStrip;
 use crate::events::Event;
 use crate::{assert_window_at, assert_window_size};
+use bevy::math::IRect;
 use bevy::prelude::*;
 
 use super::*;
+
+#[test]
+fn new_window_starts_at_complement_of_focused_width() {
+    let mut params = WindowParams::new(".*", None);
+    params.width = Some(InitialWindowWidth::Mode(
+        InitialWindowWidthMode::ComplementFocused,
+    ));
+    let config: Config = (MainOptions::default(), vec![params]).into();
+
+    TestHarness::new()
+        .with_windows(1)
+        .with_focused_window(0)
+        .on_iteration(0, move |world, state| {
+            world.insert_resource(config.clone());
+            let frame = IRect::new(0, 0, TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+            let window = state.spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, 1, frame);
+            world.trigger(SpawnWindowTrigger(vec![window]));
+        })
+        .on_iteration(1, |world, _state| {
+            assert_window_size!(world, 0, TEST_WINDOW_WIDTH, 748);
+            assert_window_size!(world, 1, TEST_DISPLAY_WIDTH - TEST_WINDOW_WIDTH, 748);
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            Event::Command {
+                command: Command::PrintState,
+            },
+        ]);
+}
+
+#[test]
+fn new_window_starts_full_width_after_full_width_focus() {
+    let mut fixed = WindowParams::new(".*", None);
+    fixed.width = Some(InitialWindowWidth::Ratio(1.0));
+    let fixed_config: Config = (MainOptions::default(), vec![fixed]).into();
+
+    let mut dynamic = WindowParams::new(".*", None);
+    dynamic.width = Some(InitialWindowWidth::Mode(
+        InitialWindowWidthMode::ComplementFocused,
+    ));
+    let dynamic_config: Config = (MainOptions::default(), vec![dynamic]).into();
+
+    TestHarness::new()
+        .with_config(fixed_config)
+        .with_windows(1)
+        .with_focused_window(0)
+        .on_iteration(0, move |world, state| {
+            assert_window_size!(world, 0, TEST_DISPLAY_WIDTH, 748);
+            world.insert_resource(dynamic_config.clone());
+            let frame = IRect::new(0, 0, TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+            let window = state.spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, 1, frame);
+            world.trigger(SpawnWindowTrigger(vec![window]));
+        })
+        .on_iteration(1, |world, _state| {
+            assert_window_size!(world, 1, TEST_DISPLAY_WIDTH, 748);
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            Event::Command {
+                command: Command::PrintState,
+            },
+        ]);
+}
+
+#[test]
+fn configured_width_uses_raw_display_bounds_with_edge_padding() {
+    let options = MainOptions {
+        padding_left: Some(20),
+        padding_right: Some(30),
+        ..MainOptions::default()
+    };
+    let mut params = WindowParams::new(".*", None);
+    params.width = Some(InitialWindowWidth::Ratio(0.5));
+    let config: Config = (options, vec![params]).into();
+
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(1)
+        .on_iteration(0, |world, state| {
+            let frame = IRect::new(0, 0, TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+            let window = state.spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, 1, frame);
+            world.trigger(SpawnWindowTrigger(vec![window]));
+        })
+        .on_iteration(1, |world, _state| {
+            assert_window_size!(world, 1, TEST_DISPLAY_WIDTH / 2, 748);
+            let mut query = world.query::<(&crate::manager::Window, &crate::ecs::WidthRatio)>();
+            let ratio = query
+                .iter(world)
+                .find_map(|(window, ratio)| (window.id() == 1).then_some(ratio.0));
+            assert_eq!(ratio, Some(0.5));
+        })
+        .run(vec![Event::MenuOpened { window_id: 0 }]);
+}
 
 #[test]
 #[allow(clippy::too_many_lines)]
@@ -209,6 +308,152 @@ fn test_window_resize_grow_and_shrink_cycle() {
         .run(commands);
 }
 
+/// Stacks two windows, then cycles the focused one's height through the
+/// presets. The window above it — the only neighbour, since the focused one is
+/// last in the stack — absorbs the whole difference, and the column keeps
+/// filling the viewport.
+#[test]
+fn test_window_vertical_resize_grow_and_shrink_cycle() {
+    // The viewport is `TEST_DISPLAY_HEIGHT - TEST_MENUBAR_HEIGHT` tall and the
+    // two stacked windows split it evenly to start with.
+    const VIEWPORT_HEIGHT: i32 = TEST_DISPLAY_HEIGHT - TEST_MENUBAR_HEIGHT;
+
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 }, // 0
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::First)),
+        }, // 1
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::East)),
+        }, // 2
+        Event::Command {
+            command: Command::Window(Operation::Stack(true)),
+        }, // 3
+        Event::Command {
+            command: Command::Window(Operation::ResizeVertical(ResizeDirection::Grow)),
+        }, // 4
+        Event::Command {
+            command: Command::Window(Operation::ResizeVertical(ResizeDirection::Grow)),
+        }, // 5
+        Event::Command {
+            command: Command::Window(Operation::ResizeVertical(ResizeDirection::Shrink)),
+        }, // 6
+    ];
+
+    let config: Config = (
+        MainOptions {
+            preset_stack_heights: vec![0.3, 0.5, 0.7],
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(2)
+        .on_iteration(3, |world, _state| {
+            assert_window_size!(world, 0, TEST_WINDOW_WIDTH, VIEWPORT_HEIGHT / 2);
+            assert_window_size!(world, 1, TEST_WINDOW_WIDTH, VIEWPORT_HEIGHT / 2);
+        })
+        .on_iteration(4, |world, _state| {
+            // 0.7 of the viewport, with window 0 giving up exactly the delta.
+            assert_window_size!(world, 1, TEST_WINDOW_WIDTH, 524);
+            assert_window_size!(world, 0, TEST_WINDOW_WIDTH, VIEWPORT_HEIGHT - 524);
+        })
+        .on_iteration(5, |world, _state| {
+            // Past the last preset, so it cycles back to the smallest.
+            assert_window_size!(world, 1, TEST_WINDOW_WIDTH, 224);
+            assert_window_size!(world, 0, TEST_WINDOW_WIDTH, VIEWPORT_HEIGHT - 224);
+        })
+        .on_iteration(6, |world, _state| {
+            // Below the smallest preset, so shrinking cycles to the largest.
+            assert_window_size!(world, 1, TEST_WINDOW_WIDTH, 524);
+            assert_window_size!(world, 0, TEST_WINDOW_WIDTH, VIEWPORT_HEIGHT - 524);
+        })
+        .run(commands);
+}
+
+/// A preset that would starve the neighbour is clamped to leave it the minimum
+/// window height, rather than letting the binpacker average the column.
+#[test]
+fn test_window_vertical_resize_leaves_the_neighbour_its_minimum() {
+    const VIEWPORT_HEIGHT: i32 = TEST_DISPLAY_HEIGHT - TEST_MENUBAR_HEIGHT;
+    const MIN_WINDOW_HEIGHT: i32 = 200;
+
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::First)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::East)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::Stack(true)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::ResizeVertical(ResizeDirection::Grow)),
+        },
+    ];
+
+    let config: Config = (
+        MainOptions {
+            // 0.9 of the viewport would leave the neighbour 75px.
+            preset_stack_heights: vec![0.5, 0.9],
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(2)
+        .on_iteration(4, |world, _state| {
+            assert_window_size!(
+                world,
+                1,
+                TEST_WINDOW_WIDTH,
+                VIEWPORT_HEIGHT - MIN_WINDOW_HEIGHT
+            );
+            assert_window_size!(world, 0, TEST_WINDOW_WIDTH, MIN_WINDOW_HEIGHT);
+        })
+        .run(commands);
+}
+
+/// Outside a stack the binpacker always stretches a column's lone member to the
+/// full viewport, so the command is a no-op there.
+#[test]
+fn test_window_vertical_resize_is_a_noop_outside_a_stack() {
+    const VIEWPORT_HEIGHT: i32 = TEST_DISPLAY_HEIGHT - TEST_MENUBAR_HEIGHT;
+
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::ResizeVertical(ResizeDirection::Shrink)),
+        },
+    ];
+
+    let config: Config = (
+        MainOptions {
+            preset_stack_heights: vec![0.3, 0.5, 0.7],
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(2)
+        .on_iteration(1, |world, _state| {
+            assert_window_size!(world, 0, TEST_WINDOW_WIDTH, VIEWPORT_HEIGHT);
+            assert_window_size!(world, 1, TEST_WINDOW_WIDTH, VIEWPORT_HEIGHT);
+        })
+        .run(commands);
+}
+
 #[test]
 fn test_window_can_resize_to_two_display_widths_and_scroll() {
     let commands = vec![
@@ -249,6 +494,31 @@ fn test_window_can_resize_to_two_display_widths_and_scroll() {
         .on_iteration(3, |world, _state| {
             assert_window_size!(world, 0, 2048, 748);
             assert_oversized_window_is_pannable(world, 0);
+        })
+        .run(commands);
+}
+
+/// A `LayoutOp::SetWidth` handed back by a Lua handler must resize the focused
+/// window just like the interactive `Operation::SetWidth` path, instead of only
+/// storing a `WidthRatio` that nothing consumes and the next bounds sync
+/// overwrites from the live frame.
+#[test]
+fn test_lua_set_width_layout_op_resizes_the_focused_window() {
+    use crate::types::windowset::LayoutOp;
+
+    const VIEWPORT_HEIGHT: i32 = TEST_DISPLAY_HEIGHT - TEST_MENUBAR_HEIGHT;
+
+    let commands = vec![Event::Command {
+        command: Command::Layout(vec![LayoutOp::SetWidth {
+            window: 0,
+            ratio: 0.5,
+        }]),
+    }];
+
+    TestHarness::new()
+        .with_windows(1)
+        .on_iteration(2, |world, _state| {
+            assert_window_size!(world, 0, TEST_DISPLAY_WIDTH / 2, VIEWPORT_HEIGHT);
         })
         .run(commands);
 }
@@ -308,6 +578,33 @@ fn test_floating_window_does_not_hold_a_slot_in_the_strip() {
             assert_eq!(window_x(world, 2), TEST_WINDOW_WIDTH);
         })
         .run(commands);
+}
+
+#[test]
+fn test_unordered_window_releases_its_layout_space() {
+    let mut harness = TestHarness::new().with_windows(3);
+
+    // Allow initial layout to settle.
+    harness.advance(Duration::from_millis(100));
+    assert_eq!(window_x(harness.app.world_mut(), 0), 0);
+    assert_eq!(window_x(harness.app.world_mut(), 1), TEST_WINDOW_WIDTH);
+    assert_eq!(window_x(harness.app.world_mut(), 2), TEST_WINDOW_WIDTH * 2);
+
+    // Window 1 disappears silently from the OS (unordered on WindowServer and dead in AX).
+    harness.mock_state.os_vanish_window(1);
+
+    // Step past the 1-second periodic CLOSED_WINDOW_CHECK_FREQ timer.
+    harness.advance(Duration::from_millis(1100));
+
+    let mut query = harness.app.world_mut().query::<&crate::manager::Window>();
+    assert!(
+        query
+            .iter(harness.app.world())
+            .all(|window| window.id() != 1),
+        "unordered window 1 should be removed within periodic check"
+    );
+    assert_eq!(window_x(harness.app.world_mut(), 0), 0);
+    assert_eq!(window_x(harness.app.world_mut(), 2), TEST_WINDOW_WIDTH);
 }
 
 /// The same invariant for a window floated by a config rule rather than by the

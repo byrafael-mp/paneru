@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub use crate::argv::{ParseError, parse_command};
+pub use crate::types::argv::{ParseError, parse_command};
 
 /// Represents a cardinal or directional choice for window manipulation.
 ///
@@ -149,7 +149,7 @@ impl<'de> Deserialize<'de> for Direction {
     }
 }
 
-/// Direction used when cycling preset resize widths.
+/// Direction used when cycling preset resize widths and heights.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResizeDirection {
@@ -225,6 +225,9 @@ pub enum Operation {
     Center,
     /// Resizes the focused window in the given direction.
     Resize(ResizeDirection),
+    /// Cycles the focused window's height through the preset stack heights.
+    /// Only applies to windows inside a stack.
+    ResizeVertical(ResizeDirection),
     /// Resizes the focused window to an exact display-width ratio.
     SetWidth(f64),
     /// Toggles the focused window to full width or a preset width.
@@ -239,11 +242,23 @@ pub enum Operation {
     Manage,
     /// Stacks or unstacks a window. The boolean indicates whether to stack (`true`) or unstack (`false`).
     Stack(bool),
+    /// Toggles the focused window's stack between a normal split display
+    /// (all windows visible, sharing height) and a tabbed display (one
+    /// window visible at a time, sharing the full column). Cycle tabs with
+    /// the existing `Focus` North/South directions.
+    ToggleTabbedDisplay,
     /// Resizes and repositions the focused window to fit within the visible viewport
     /// (including edge padding).
     Snap,
     /// Cyclically selects the virtual strip for the current workspace.
     Virtual(Direction),
+    /// North/South only: focuses a stack neighbor above/below the focused
+    /// window if one exists (the same within-column traversal as `Focus`),
+    /// otherwise cyclically selects the virtual strip like `Virtual` would.
+    /// A distinct command from `Virtual` so a plain virtual-workspace-switch
+    /// binding keeps meaning exactly that, unconditionally. A no-op on any
+    /// other direction.
+    FocusOrVirtual(Direction),
     /// Selects a virtual strip by its zero-based index for the current workspace.
     VirtualNumber(u32),
     /// Creates a new empty virtual strip after the highest existing one for
@@ -264,6 +279,9 @@ pub enum Operation {
     /// Flips `FloatingLayer`, raises the other windows in the new top tier,
     /// and focuses the tier's last-focused window.
     ToggleFloatingLayer,
+    /// Copies a `[windows]` configuration rule for the focused window to the
+    /// clipboard.
+    CopyRule,
 }
 
 /// Defines operations that can be performed on the mouse.
@@ -293,5 +311,5 @@ pub enum Command {
     /// Layout operations a Lua handler produced by transforming a `WindowSet`.
     /// Window-addressed, unlike every other command here, and applied
     /// best-effort: see `ecs::layout_ops`. Never produced by parsing.
-    Layout(Vec<crate::windowset::LayoutOp>),
+    Layout(Vec<crate::types::windowset::LayoutOp>),
 }

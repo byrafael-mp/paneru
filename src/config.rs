@@ -17,8 +17,11 @@ use std::{
 use stdext::function_name;
 use tracing::{error, info, warn};
 
-use self::decorations::BorderRadiusOption;
+use self::decorations::{
+    BorderRadiusOption, DescriptorStyle, IndicatorFormat, IndicatorStyle, MenubarOrientation,
+};
 use self::swipe::SwipeGestureDirection;
+
 #[cfg(test)]
 use crate::commands::{MoveFocus, Operation, ResizeDirection};
 use crate::{
@@ -34,6 +37,7 @@ use crate::{platform::CFStringRef, util::AXUIWrapper};
 
 pub mod decorations;
 pub mod padding;
+pub mod snippet;
 pub mod swipe;
 
 /// A `LazyLock` that determines the path to the application's configuration file.
@@ -291,7 +295,7 @@ pub fn deprecated_options_in_file(path: &Path) -> Result<Vec<String>> {
 /// "focus", "east"]`), mapping the shared vocabulary crate's parse error into
 /// this crate's configuration error.
 pub fn parse_command(argv: &[&str]) -> Result<Command> {
-    paneru_shared_types::commands::parse_command(argv)
+    crate::types::commands::parse_command(argv)
         .map_err(|err| Error::InvalidConfig(format!("{}: {err}", function_name!())))
 }
 
@@ -489,6 +493,10 @@ impl Config {
 
     pub fn preset_column_widths(&self) -> Vec<f64> {
         self.options().preset_column_widths
+    }
+
+    pub fn preset_stack_heights(&self) -> Vec<f64> {
+        self.options().preset_stack_heights
     }
 
     pub fn swipe_gesture_direction(&self) -> SwipeGestureDirection {
@@ -747,6 +755,15 @@ impl Config {
             .and_then(|scroll| scroll.vertical_modifier)
     }
 
+    pub fn swipe_scroll_window_step(&self) -> bool {
+        self.inner()
+            .swipe
+            .as_ref()
+            .and_then(|swipe| swipe.scroll.as_ref())
+            .and_then(|scroll| scroll.window_step)
+            .unwrap_or(false)
+    }
+
     pub fn window_dim_ratio(&self, is_dark: bool) -> Option<f32> {
         let config = self.inner();
         if config
@@ -882,6 +899,125 @@ impl Config {
             .create_virtual_workspace_automatically
             .is_some_and(|enabled| enabled)
     }
+    pub fn menubar_orientation(&self) -> MenubarOrientation {
+        self.inner()
+            .decorations
+            .as_ref()
+            .and_then(|decorations| decorations.menu.as_ref())
+            .and_then(|menubar| menubar.orientation)
+            .unwrap_or(MenubarOrientation::Default)
+    }
+    pub fn menubar_gradient(&self) -> Vec<(f64, f64, f64)> {
+        self.inner()
+            .decorations
+            .as_ref()
+            .and_then(|decorations| decorations.menu.as_ref())
+            .and_then(|menubar| menubar.colors.as_ref())
+            .into_iter()
+            .flatten()
+            .map(|hex_string| resolve_menubar_color(hex_string))
+            .collect()
+    }
+    /// True when at least one menubar colour is an explicit hex stop rather than
+    /// the empty-string system-appearance sentinel.
+    pub fn menubar_has_external_gradient(&self) -> bool {
+        self.menubar_gradient()
+            .iter()
+            .any(|(red, _, _)| !red.is_nan())
+    }
+    pub fn menubar_gradient_angle(&self) -> f64 {
+        self.inner()
+            .decorations
+            .as_ref()
+            .and_then(|decorations| decorations.menu.as_ref())
+            .and_then(|menubar| menubar.angle)
+            .unwrap_or(90.0)
+    }
+    pub fn menubar_descriptor_style(&self) -> DescriptorStyle {
+        self.inner()
+            .decorations
+            .as_ref()
+            .and_then(|decorations| decorations.menu.as_ref())
+            .and_then(|menubar| menubar.descriptor.as_ref())
+            .and_then(|descriptor_options| descriptor_options.style)
+            .unwrap_or(DescriptorStyle::Symbol)
+    }
+    pub fn menubar_descriptor_text(&self) -> String {
+        self.inner()
+            .decorations
+            .as_ref()
+            .and_then(|decorations| decorations.menu.as_ref())
+            .and_then(|menubar| menubar.descriptor.as_ref())
+            .and_then(|descriptor_options| descriptor_options.text.clone())
+            .unwrap_or(String::from("VW"))
+    }
+    pub fn menubar_descriptor_symbol(&self) -> String {
+        self.inner()
+            .decorations
+            .as_ref()
+            .and_then(|decorations| decorations.menu.as_ref())
+            .and_then(|menubar| menubar.descriptor.as_ref())
+            .and_then(|descriptor_options| descriptor_options.symbol.clone())
+            .unwrap_or(String::from("fish.fill"))
+    }
+    pub fn menubar_indicator_style(&self) -> IndicatorStyle {
+        self.inner()
+            .decorations
+            .as_ref()
+            .and_then(|decorations| decorations.menu.as_ref())
+            .and_then(|menubar| menubar.indicator.as_ref())
+            .and_then(|indicator| indicator.style)
+            .unwrap_or(IndicatorStyle::Mono)
+    }
+    pub fn menubar_indicator_format(&self) -> IndicatorFormat {
+        self.inner()
+            .decorations
+            .as_ref()
+            .and_then(|decorations| decorations.menu.as_ref())
+            .and_then(|menubar| menubar.indicator.as_ref())
+            .and_then(|indicator| indicator.format)
+            .unwrap_or(IndicatorFormat::Default)
+    }
+    pub fn menubar_indicator_font_size(&self) -> f64 {
+        const DEFAULT_FONT_SIZE: f64 = 13.0;
+        const MIN_FONT_SIZE: f64 = 1.0;
+        const MAX_FONT_SIZE: f64 = 24.0;
+        self.inner()
+            .decorations
+            .as_ref()
+            .and_then(|decorations| decorations.menu.as_ref())
+            .and_then(|menubar| menubar.indicator.as_ref())
+            .and_then(|indicator| indicator.font_size)
+            .filter(|font_size| font_size.is_finite())
+            .unwrap_or(DEFAULT_FONT_SIZE)
+            .clamp(MIN_FONT_SIZE, MAX_FONT_SIZE)
+    }
+    pub fn menubar_indicator_active_character(&self) -> char {
+        self.inner()
+            .decorations
+            .as_ref()
+            .and_then(|decorations| decorations.menu.as_ref())
+            .and_then(|menubar| menubar.indicator.as_ref())
+            .and_then(|indicator| indicator.active_character)
+            .unwrap_or('☉')
+    }
+    pub fn menubar_indicator_inactive_character(&self) -> char {
+        self.inner()
+            .decorations
+            .as_ref()
+            .and_then(|decorations| decorations.menu.as_ref())
+            .and_then(|menubar| menubar.indicator.as_ref())
+            .and_then(|indicator| indicator.inactive_character)
+            .unwrap_or('○')
+    }
+}
+
+fn resolve_menubar_color(hex: &str) -> (f64, f64, f64) {
+    let check_string = hex.is_empty();
+    if !check_string {
+        return parse_hex_color(hex);
+    }
+    (f64::NAN, f64::NAN, f64::NAN)
 }
 
 fn parse_hex_color(hex: &str) -> (f64, f64, f64) {
@@ -1074,12 +1210,14 @@ impl InnerConfig {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[cfg_attr(test, derive(serde::Serialize))]
 #[serde(rename_all = "snake_case")]
 pub enum MissingWindowBehavior {
     Ignore,
 }
 
 #[derive(Clone, Debug, Deserialize, Default)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub struct RestoreOptions {
     pub enabled: Option<bool>,
     pub startup_grace_ms: Option<u64>,
@@ -1089,6 +1227,7 @@ pub struct RestoreOptions {
 /// `MainOptions` represents the primary configuration options for the window manager.
 /// These options control various behaviors such as mouse focus, gesture recognition, and window animation.
 #[derive(Deserialize, Clone, Debug, Default)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub struct MainOptions {
     /// Enables or disables focus follows mouse behavior.
     pub focus_follows_mouse: Option<bool>,
@@ -1110,6 +1249,10 @@ pub struct MainOptions {
     /// A list of preset column widths (as ratios) used for resizing windows.
     #[serde(default = "default_preset_column_widths")]
     pub preset_column_widths: Vec<f64>,
+    /// A list of preset heights (as ratios of the viewport) used when resizing
+    /// a window vertically inside a stack.
+    #[serde(default = "default_preset_stack_heights")]
+    pub preset_stack_heights: Vec<f64>,
     /// The animation speed for window movements in pixels per second.
     pub animation_speed: Option<f64>,
     /// Automatically center the window when switching focus with keyboard.
@@ -1149,6 +1292,7 @@ pub struct MainOptions {
     pub swipe_deceleration: Option<f64>,
     /// The modifier key used for mouse-based window resizing.
     #[serde(default, deserialize_with = "deserialize_modifier")]
+    #[cfg_attr(test, serde(serialize_with = "serialize_modifier"))]
     pub mouse_resize_modifier: Option<Modifiers>,
     /// Override the system menubar height (in pixels).
     /// When set, this value is used instead of the height reported by macOS.
@@ -1158,7 +1302,8 @@ pub struct MainOptions {
     /// fully invisible. E.g. 0.5 = tolerate up to 50% hidden.
     pub window_hidden_ratio: Option<f64>,
 
-    /// Whether grow/shrink cycles back when reaching the end of presets.
+    /// Whether grow/shrink cycles back when reaching the end of presets. Applies
+    /// to both the horizontal and the vertical resize commands.
     /// Default: true (cycles). Set to false to stop at the limits.
     pub window_resize_cycle: Option<bool>,
 
@@ -1190,6 +1335,12 @@ pub struct MainOptions {
 /// Returns a default set of column widths.
 pub fn default_preset_column_widths() -> Vec<f64> {
     vec![0.25, 0.33333, 0.50, 0.66667, 0.75, 1.0, 1.5, 2.0]
+}
+
+/// Returns a default set of stacked window heights. Unlike widths there is no
+/// vertical scrolling, so ratios never exceed the viewport.
+pub fn default_preset_stack_heights() -> Vec<f64> {
+    vec![0.25, 0.33333, 0.50, 0.66667, 0.75]
 }
 
 /// `Keybinding` represents a keyboard shortcut and the command it triggers.
@@ -1239,6 +1390,71 @@ impl<'de> Deserialize<'de> for Keybinding {
     }
 }
 
+/// The initial width of a managed window, either fixed or based on the focused window.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(untagged)]
+pub enum InitialWindowWidth {
+    Ratio(f64),
+    Mode(InitialWindowWidthMode),
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InitialWindowWidthMode {
+    ComplementFocused,
+}
+
+impl InitialWindowWidth {
+    pub fn ratio(self, focused_ratio: Option<f64>) -> f64 {
+        match self {
+            Self::Ratio(ratio) => ratio,
+            Self::Mode(InitialWindowWidthMode::ComplementFocused) => {
+                // The first window, or one opened from an almost full-width
+                // window, should occupy the display rather than a tiny sliver.
+                let Some(ratio) = focused_ratio.filter(|ratio| ratio.is_finite() && *ratio > 0.0)
+                else {
+                    return 1.0;
+                };
+                if ratio >= 0.95 { 1.0 } else { 1.0 - ratio }
+            }
+        }
+    }
+}
+
+#[test]
+#[allow(clippy::float_cmp)]
+fn test_initial_window_width_config() {
+    let config = Config::try_from(
+        r#"
+[windows.dynamic]
+title = ".*"
+width = "complement_focused"
+"#,
+    )
+    .expect("dynamic width rule parses");
+    let width = config.find_window_properties("Window 1", "")[0]
+        .width
+        .expect("matched width rule");
+    assert_eq!(width.ratio(Some(0.25)), 0.75);
+    assert_eq!(width.ratio(Some(0.5)), 0.5);
+    assert_eq!(width.ratio(Some(0.95)), 1.0);
+    assert_eq!(width.ratio(Some(1.0)), 1.0);
+    assert_eq!(width.ratio(None), 1.0);
+
+    let config = Config::try_from(
+        r#"
+[windows.fixed]
+title = ".*"
+width = 0.5
+"#,
+    )
+    .expect("fixed width rule still parses");
+    let width = config.find_window_properties("Window 1", "")[0]
+        .width
+        .expect("matched width rule");
+    assert_eq!(width.ratio(Some(0.25)), 0.5);
+}
+
 /// `WindowParams` defines rules and properties for specific windows based on their title or bundle ID.
 /// These parameters can override default window management behavior, such as forcing a window to float or setting its initial index.
 #[derive(Clone, Debug, Deserialize)]
@@ -1258,10 +1474,11 @@ pub struct WindowParams {
     pub vertical_padding: Option<i32>,
     pub horizontal_padding: Option<i32>,
     pub dont_focus: Option<bool>,
-    /// An optional positive initial width ratio relative to the display width.
-    /// Values above 1.0 create an oversized, horizontally scrollable window.
+    /// A positive initial width ratio relative to the display width, or
+    /// `"complement_focused"` to fill the width left by the focused window.
+    /// Fixed ratios above 1.0 create an oversized, horizontally scrollable window.
     /// Overrides the default column width when the window is first managed.
-    pub width: Option<f64>,
+    pub width: Option<InitialWindowWidth>,
     /// Grid placement for floating windows: "cols:rows:x:y:w:h".
     /// Divides the display into a grid and positions the window at the given cell/span.
     pub grid: Option<String>,
@@ -1341,6 +1558,42 @@ where
     parse_modifiers(&s)
         .map(Some)
         .map_err(|e: Error| serde::de::Error::custom(e.to_string()))
+}
+
+#[cfg(test)]
+#[allow(clippy::ref_option, clippy::trivially_copy_pass_by_ref)]
+pub(crate) fn serialize_modifier<S: serde::Serializer>(
+    val: &Option<Modifiers>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    serializer.serialize_some(&val.as_ref().map(Modifiers::bits))
+}
+
+#[cfg(feature = "lua")]
+pub(crate) fn format_modifiers(modifiers: Modifiers) -> String {
+    let mut rem = modifiers;
+    let mut parts = Vec::new();
+    for (mask, name) in [
+        (Modifiers::ALT, "alt"),
+        (Modifiers::LALT, "lalt"),
+        (Modifiers::RALT, "ralt"),
+        (Modifiers::SHIFT, "shift"),
+        (Modifiers::LSHIFT, "lshift"),
+        (Modifiers::RSHIFT, "rshift"),
+        (Modifiers::CMD, "cmd"),
+        (Modifiers::LCMD, "lcmd"),
+        (Modifiers::RCMD, "rcmd"),
+        (Modifiers::CTRL, "ctrl"),
+        (Modifiers::LCTRL, "lctrl"),
+        (Modifiers::RCTRL, "rctrl"),
+        (Modifiers::FN, "fn"),
+    ] {
+        if rem.contains(mask) {
+            parts.push(name);
+            rem.remove(mask);
+        }
+    }
+    parts.join(" + ")
 }
 
 /// Builds a [`Config`] from the Lua table passed to `paneru.setup{...}`,
@@ -1993,6 +2246,31 @@ fn test_parse_resize_commands() {
 }
 
 #[test]
+fn test_parse_vertical_resize_commands() {
+    assert!(matches!(
+        parse_command(&["window", "vertical"]).unwrap(),
+        Command::Window(Operation::ResizeVertical(ResizeDirection::Grow))
+    ));
+    assert!(matches!(
+        parse_command(&["window", "vertical", "resize"]).unwrap(),
+        Command::Window(Operation::ResizeVertical(ResizeDirection::Grow))
+    ));
+    assert!(matches!(
+        parse_command(&["window", "vertical", "grow"]).unwrap(),
+        Command::Window(Operation::ResizeVertical(ResizeDirection::Grow))
+    ));
+    assert!(matches!(
+        parse_command(&["window", "vertical", "shrink"]).unwrap(),
+        Command::Window(Operation::ResizeVertical(ResizeDirection::Shrink))
+    ));
+    assert!(matches!(
+        parse_command(&["window", "vertical", "resize", "shrink"]).unwrap(),
+        Command::Window(Operation::ResizeVertical(ResizeDirection::Shrink))
+    ));
+    assert!(parse_command(&["window", "vertical", "wider"]).is_err());
+}
+
+#[test]
 fn test_parse_restart_command() {
     assert!(matches!(
         parse_command(&["restart"]).unwrap(),
@@ -2145,7 +2423,14 @@ fn test_config_defaults() {
     assert_eq!(config.border_color(), (1.0, 1.0, 1.0));
     assert_eq!(config.border_opacity(), 1.0);
     assert_eq!(config.border_width(), 2.0);
-    assert_eq!(config.border_radius(), BorderRadiusOption::Auto);
+    // Automatic radius detection is only enabled on macOS 26; other
+    // releases use the fixed-radius fallback.
+    let expected_radius = if macos_major_version() == 26 {
+        BorderRadiusOption::Auto
+    } else {
+        BorderRadiusOption::Value(10.0)
+    };
+    assert_eq!(config.border_radius(), expected_radius);
     assert_eq!(config.menubar_height(), None);
 }
 
@@ -2306,13 +2591,18 @@ mod lua_setup_tests {
         let config = config_from_source(
             r"return {
                 default_workspaces = 3,
-                options = { sliver_width = 9, focus_follows_mouse = false },
+                options = {
+                    sliver_width = 9,
+                    focus_follows_mouse = false,
+                    preset_stack_heights = { 0.3, 0.7 },
+                },
                 padding = { top = 10, bottom = 4 },
             }",
         );
         assert_eq!(config.default_workspaces(), 3);
         assert_eq!(config.sliver_width(), 9);
         assert!(!config.focus_follows_mouse());
+        assert_eq!(config.preset_stack_heights(), vec![0.3, 0.7]);
         let (top, _right, bottom, _left) = config.edge_padding();
         assert_eq!((top, bottom), (10, 4));
     }

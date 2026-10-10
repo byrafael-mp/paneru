@@ -87,7 +87,7 @@
         commonArgs
         // {
           inherit pname;
-          cargoExtraArgs = "--features lua,${luaFeature defaultLua}";
+          cargoExtraArgs = "--no-default-features --features lua,${luaFeature defaultLua}";
           nativeBuildInputs = [ pkgs.pkg-config ];
           buildInputs = [
             pkgs.apple-sdk.privateFrameworksHook
@@ -126,7 +126,8 @@
             buildInputs = lib.optional enableLua lua;
           };
 
-          cargoExtraArgs = lib.optionalString enableLua "--features lua,${luaFeature lua}";
+          cargoExtraArgs =
+            "--no-default-features " + lib.optionalString enableLua "--features lua,${luaFeature lua}";
 
           # --- Loadable Lua C module, as a function of the interpreter -------
           #
@@ -156,11 +157,11 @@
                   nativeBuildInputs = [ pkgs.pkg-config ];
                   buildInputs = [ lua ];
                   # Select the Lua ABI feature matching the interpreter.
-                  cargoExtraArgs = "-p paneru-lua --no-default-features --features module,${luaFeature lua}";
+                  cargoExtraArgs = "--lib --no-default-features --features module,${luaFeature lua}";
                   # Install the cdylib as `paneru.so` under the interpreter's
                   # C-module path, so a `${moduleDir}/?.so` cpath entry finds it.
                   installPhaseCommand = ''
-                    so=$(find target -name 'libpaneru_lua.dylib' -print -quit)
+                    so=$(find target -name 'libpaneru.dylib' -print -quit)
                     if [ -z "$so" ]; then
                       echo "paneru-lua: could not find built cdylib" >&2
                       exit 1

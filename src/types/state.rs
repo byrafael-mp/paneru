@@ -171,8 +171,8 @@ impl QueryState {
     /// This is what actually crosses between processes; the two JSON spellings
     /// above are for a terminal and for the embedded Lua runtime.
     #[must_use]
-    pub fn to_query_payload(&self, kind: StateQueryKind) -> crate::wire::QueryPayload {
-        use crate::wire::QueryPayload;
+    pub fn to_query_payload(&self, kind: StateQueryKind) -> crate::types::wire::QueryPayload {
+        use crate::types::wire::QueryPayload;
         match kind {
             StateQueryKind::State => QueryPayload::State(Box::new(self.clone())),
             StateQueryKind::VirtualWorkspaces => {
@@ -247,7 +247,7 @@ impl StateEvent {
     /// If serialization fails, which should not happen barring a bug in this
     /// type's `Serialize` impl.
     pub fn to_json(&self) -> serde_json::Result<serde_json::Value> {
-        Ok(crate::json::flatten_tag(
+        Ok(crate::types::json::flatten_tag(
             serde_json::to_value(self)?,
             "event",
         ))
@@ -257,6 +257,7 @@ impl StateEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::wire::{Codec, MessagePack};
 
     #[test]
     fn query_kinds_round_trip_through_their_tokens() {
@@ -297,9 +298,9 @@ mod tests {
         assert!(line.contains(r#""event":"on_screen_changed""#));
         assert!(line.contains(r#""windows":"#));
 
-        let bytes = postcard::to_allocvec(&event).unwrap();
+        let bytes = MessagePack.encode(&event).unwrap();
         assert_eq!(
-            postcard::from_bytes::<StateEvent>(&bytes).unwrap(),
+            MessagePack.decode::<StateEvent>(&bytes).unwrap(),
             event,
             "clients must decode exactly what the daemon emits"
         );

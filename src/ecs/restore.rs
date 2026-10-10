@@ -12,15 +12,14 @@ use objc2_core_graphics::CGDirectDisplayID;
 use tracing::{Level, info, instrument, warn};
 
 use crate::config::{Config, MissingWindowBehavior};
-use crate::ecs::layout::LayoutStrip;
+use crate::ecs::layout::{LayoutStrip, PARKED_STRIP_SLIVER};
 use crate::ecs::params::{WindowCtx, Windows};
 use crate::ecs::state::{
     PaneruState, SavedColumn, SavedStackItem, SavedStrip, SavedWindow, SavedWorkspace,
 };
 use crate::ecs::workspace::PreviousStripPosition;
 use crate::ecs::{
-    ActiveDisplayMarker, ActiveWorkspaceMarker, RefreshWindowSizes, RestoreWindowState,
-    SpawnCommandsExt, Unmanaged,
+    ActiveDisplayMarker, ActiveWorkspaceMarker, RestoreWindowState, SpawnCommandsExt, Unmanaged,
 };
 use crate::manager::{Application, Display, Window};
 use crate::platform::{Pid, WinID, WorkspaceId};
@@ -465,7 +464,11 @@ pub(super) fn restore_window_state(
             strip.remove(*entity);
         }
 
-        if had_consumed_window && strip.all_windows().is_empty() {
+        // Row 0 is the row every space is created with. Emptying it is normal
+        // (its windows move onto the restored rows), but despawning it leaves
+        // the space numbered from "2" with no row that any later switch or
+        // reap path recreates, so it is kept and reused instead.
+        if had_consumed_window && strip.all_windows().is_empty() && strip.virtual_index > 0 {
             emptied_existing_strips.insert(entity);
         }
     }
@@ -545,7 +548,7 @@ pub(super) fn restore_window_state(
         let origin = if is_global_active {
             display.bounds().min
         } else {
-            display.bounds().max - 10
+            display.bounds().max - PARKED_STRIP_SLIVER
         };
         let previous = PreviousStripPosition {
             origin: display.bounds().min,
@@ -555,7 +558,7 @@ pub(super) fn restore_window_state(
         let mut spawned =
             ctx.commands
                 .spawn_layout_strip(strip, origin, display_entity, is_global_active);
-        spawned.try_insert(RefreshWindowSizes::default());
+
         if !is_global_active {
             spawned.insert(previous);
         }
