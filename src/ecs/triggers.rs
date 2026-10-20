@@ -493,28 +493,44 @@ pub(super) fn mission_control_trigger(
             Event::MissionControlExit => {
                 mission_control_active.as_mut().0 = false;
 
-                // Check if some windows disappeared from the current workspace
-                // - e.g. they were moved away during mission control.
-                if let Some(mut active_strip) = workspaces
+                // A window dragged to another desktop can leave the source
+                // workspace while Mission Control activates the destination.
+                // Reconcile every native workspace: checking only the newly
+                // active strip leaves the moved window in its old strip.
+                let stale_windows = workspaces
                     .iter_mut()
-                    .find_map(|(_, strip, active, _)| active.then_some(strip))
-                    && let Ok(present_windows) =
-                        window_manager.windows_in_workspace(active_strip.id())
-                {
-                    let moved_windows = active_strip
-                        .all_windows()
-                        .into_iter()
-                        .filter_map(|entity| windows.get(entity).zip(Some(entity)))
-                        .filter(|(window, _)| !present_windows.contains(&window.id()));
-                    for (window, entity) in moved_windows {
-                        debug!(
-                            "window {} {entity} moved, removing from workspace {}",
-                            window.id(),
-                            active_strip.id(),
-                        );
-                        // Simply removing them from the current strip is enough,
-                        // they will be re-detected during the workspace change.
-                        active_strip.remove(entity);
+                    .filter_map(|(_, strip, _, _)| {
+                        let present_windows = window_manager
+                            .windows_in_workspace(strip.id())
+                            .inspect_err(|err| {
+                                warn!("unable to get windows in workspace {}: {err}", strip.id());
+                            })
+                            .ok()?;
+                        let stale = strip
+                            .all_windows()
+                            .into_iter()
+                            .filter_map(|entity| {
+                                windows
+                                    .get(entity)
+                                    .filter(|window| !present_windows.contains(&window.id()))
+                                    .map(|window| (strip.id(), window.id(), entity))
+                            })
+                            .collect::<Vec<_>>();
+                        Some(stale)
+                    })
+                    .flatten()
+                    .collect::<Vec<_>>();
+
+                for (workspace_id, window_id, entity) in stale_windows {
+                    debug!(
+                        "window {window_id} {entity} moved, removing from workspace {workspace_id}"
+                    );
+                    if let Some(mut strip) = workspaces.iter_mut().find_map(|(_, strip, _, _)| {
+                        (strip.id() == workspace_id && strip.contains(entity)).then_some(strip)
+                    }) {
+                        // The window is discovered in its destination when that
+                        // workspace becomes active.
+                        strip.remove(entity);
                     }
                 }
             }
