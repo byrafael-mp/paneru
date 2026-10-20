@@ -16,7 +16,7 @@ use crate::ecs::layout::{Column, LayoutStrip};
 use crate::ecs::params::{ActiveDisplay, Windows};
 use crate::ecs::{
     ActiveWorkspaceMarker, ManualStripOffset, MissionControlActive, Position, Scrolling,
-    SendMessageTrigger, SnapPending, SpawnCommandsExt,
+    SendMessageTrigger, SnapPending, SpawnCommandsExt, UpdateSet,
 };
 use crate::errors::Result;
 use bevy::ecs::schedule::common_conditions::on_message;
@@ -87,7 +87,8 @@ impl Plugin for ScrollEventsPlugin {
                     .chain()
                     .before(snap_settled_strip),
                 snap_settled_strip,
-            ),
+            )
+                .in_set(UpdateSet::Input),
         );
     }
 }
@@ -481,7 +482,9 @@ where
     };
 
     let left_snap = strip_position(layout_strip.last());
-    let right_snap = strip_position(layout_strip.first());
+    // NOTE: this snaps to the second window on purpose.
+    // For a single colum workspace this will return None
+    let right_snap = strip_position(layout_strip.get(1));
 
     Some(
         if continuous_swipe && let Some((left_snap, right_snap)) = left_snap.zip(right_snap) {

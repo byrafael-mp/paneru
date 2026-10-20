@@ -1,10 +1,12 @@
 use std::time::Duration;
 
-use bevy::app::PreUpdate;
+use bevy::app::{PostUpdate, PreUpdate};
 use bevy::ecs::entity::{Entity, EntityHashSet};
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::message::MessageReader;
 use bevy::ecs::query::{Has, With, Without};
+use bevy::ecs::schedule::IntoScheduleConfigs as _;
+use bevy::ecs::schedule::common_conditions::{on_message, resource_changed};
 use bevy::ecs::system::{Commands, Query, Res, Single};
 use bevy::math::IRect;
 use tracing::{Level, instrument};
@@ -26,7 +28,7 @@ use crate::ecs::{
     SendMessageTrigger, SpawnCommandsExt, Timeout, Unmanaged,
 };
 use crate::events::Event;
-use crate::manager::{Application, Display, Origin, Size, Window, WindowManager, origin_from};
+use crate::manager::{Application, Display, Size, Window, WindowManager, origin_from};
 use crate::platform::WorkspaceId;
 use crate::util::round_px;
 
@@ -59,16 +61,35 @@ type StripsWithVisibility<'w, 's> = Query<
 >;
 
 pub fn register_commands(app: &mut bevy::app::App) {
+    app.init_resource::<crate::menubar::MenuBarVisibility>()
+        .add_systems(
+            PreUpdate,
+            crate::menubar::menu_bar_command_handler
+                .in_set(crate::ecs::PreUpdateSet::Dispatch)
+                .run_if(on_message::<Event>),
+        )
+        .add_systems(
+            PostUpdate,
+            crate::menubar::save_menu_bar_preference
+                .in_set(crate::ecs::PostUpdateSet::Bookkeeping)
+                .run_if(resource_changed::<crate::menubar::MenuBarVisibility>),
+        );
     // Registered here (not with the Lua systems) so it's exercised by the mock
     // harness without a running interpreter.
     #[cfg(feature = "lua")]
-    app.add_systems(PreUpdate, crate::ecs::layout_ops::apply_layout_ops);
+    app.add_systems(
+        PreUpdate,
+        crate::ecs::layout_ops::apply_layout_ops.in_set(crate::ecs::PreUpdateSet::Dispatch),
+    );
 
     query::register_query_commands(app);
     // Empty store so the mock harness and saveless runs still have one to
     // answer from; the real app overwrites it from disk.
     app.init_resource::<crate::ecs::script_state::ScriptStateStore>();
-    app.add_systems(PreUpdate, crate::ecs::script_state::script_state_handler);
+    app.add_systems(
+        PreUpdate,
+        crate::ecs::script_state::script_state_handler.in_set(crate::ecs::PreUpdateSet::Dispatch),
+    );
     app.add_systems(
         PreUpdate,
         (
@@ -92,7 +113,8 @@ pub fn register_commands(app: &mut bevy::app::App) {
             command_toggle_floating_layer,
             command_swap_focus,
             snap_window,
-        ),
+        )
+            .in_set(crate::ecs::PreUpdateSet::Dispatch),
     );
     // A separate registration because the tuple above is already at Bevy's
     // 20-system limit.
@@ -100,7 +122,11 @@ pub fn register_commands(app: &mut bevy::app::App) {
     // A default dialect so the mock harness has one; the real app overwrites it
     // once it knows whether a Lua script took over the configuration.
     app.init_resource::<SnippetDialect>();
-    app.add_systems(PreUpdate, (copy_window_rule, toggle_tabbed_display_handler));
+    app.add_systems(
+        PreUpdate,
+        (copy_window_rule, toggle_tabbed_display_handler)
+            .in_set(crate::ecs::PreUpdateSet::Dispatch),
+    );
 }
 
 pub fn filter_window_operations<'a, F: Fn(&Operation) -> bool>(
@@ -819,13 +845,6 @@ fn resize_window(
     let new_width = round_px(next_ratio * f64::from(viewport.width()));
     let size = Size::new(new_width, frame.height());
 
-    let origin = clamp_origin_to_viewport(
-        IRect::from_center_size(frame.center(), size).min,
-        size,
-        viewport,
-    );
-    commands.reposition_entity(entity, origin);
-
     // Resize all windows in the column so stacked siblings share the new width.
     let strip = active_display.active_strip();
     if let Some(Column::Stack(stack)) = strip
@@ -987,6 +1006,7 @@ fn full_width_window(
         let w = round_px(marker.width_ratio * f64::from(viewport.width()));
         let bounds = active_display.actual_bounds(&config).size().with_x(w);
         commands.resize_entity(entity, bounds);
+        commands.reshuffle_around(entity);
     } else {
         let strip = active_display.active_strip();
         if strip
@@ -1001,7 +1021,6 @@ fn full_width_window(
         if let Ok(mut entity_commands) = commands.get_entity(entity) {
             entity_commands.try_insert(FullWidthMarker { width_ratio });
         }
-        commands.reposition_entity(entity, Origin::new(viewport.min.x, viewport.min.y));
         commands.resize_entity(entity, Size::new(viewport.width(), viewport.height()));
         commands.reshuffle_around(entity);
     }

@@ -2,11 +2,12 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use bevy::app::{App, Plugin, PostUpdate, Update};
+use bevy::ecs::component::Component;
 use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::lifecycle::{Add, Remove};
 use bevy::ecs::observer::On;
-use bevy::ecs::query::{Added, Has, With};
+use bevy::ecs::query::{Added, Has, With, Without};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::system::{Commands, Populated, Query, Res, Single};
@@ -21,8 +22,9 @@ use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
 use crate::ecs::workspace::RestoreFocusMarker;
 use crate::ecs::{
-    ActiveWorkspaceMarker, Bounds, Position, RaiseWindow, RepositionMarker, ResizeMarker,
-    Scrolling, SendMessageTrigger, SpawnCommandsExt, StrayFocusEvent,
+    ActiveWorkspaceMarker, Bounds, Position, RaiseWindow, RepositionMarker, ReshuffleAroundMarker,
+    ResizeMarker, Scrolling, SendMessageTrigger, SpawnCommandsExt, StrayFocusEvent,
+    VerifyWindowSize,
 };
 use crate::events::Event;
 use crate::manager::{Application, Display, Window, WindowManager};
@@ -110,20 +112,24 @@ impl Plugin for FocusEventsPlugin {
         app.add_systems(
             Update,
             (
-                detect_focus_rejection.before(super::systems::timeout_ticker),
-                fix_window_size_on_focus,
+                detect_focus_rejection.in_set(super::UpdateSet::Events),
+                fix_window_size_on_focus.in_set(super::UpdateSet::Focus),
+                autocenter_window_on_focus
+                    .in_set(super::UpdateSet::Layout)
+                    .after(super::layout::layout_strip_changed)
+                    .before(super::layout::reshuffle_layout_strip),
             ),
         );
         app.add_systems(
             PostUpdate,
             (
-                autocenter_window_on_focus.after(super::systems::animate_resize_entities),
-                // Bevy must apply the deferred centering commands before
-                // the pointer reads the window's destination.
-                mouse_follows_focus.after(autocenter_window_on_focus),
-                recover_lost_focus.run_if(on_timer(Duration::from_millis(
-                    REFRESH_WINDOW_CHECK_FREQ_MS,
-                ))),
+                clear_pending_focus_layout.in_set(super::PostUpdateSet::Bookkeeping),
+                mouse_follows_focus.in_set(super::PostUpdateSet::Ui),
+                recover_lost_focus
+                    .in_set(super::PostUpdateSet::Bookkeeping)
+                    .run_if(on_timer(Duration::from_millis(
+                        REFRESH_WINDOW_CHECK_FREQ_MS,
+                    ))),
             ),
         );
         app.add_observer(dim_remove_window_trigger)
@@ -141,6 +147,19 @@ impl Plugin for FocusEventsPlugin {
 pub(super) struct FocusWindow {
     pub entity: Entity,
     pub raise: bool,
+}
+
+/// Protects command focus until its pending layout has queued movement targets.
+#[derive(Component)]
+pub(super) struct PendingFocusLayout;
+
+fn clear_pending_focus_layout(
+    pending: Populated<Entity, (With<PendingFocusLayout>, Without<ReshuffleAroundMarker>)>,
+    mut commands: Commands,
+) {
+    for entity in pending {
+        commands.entity(entity).try_remove::<PendingFocusLayout>();
+    }
 }
 
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
@@ -166,6 +185,9 @@ fn maintain_focus_singleton(
     // Skip reshuffle if caused by mouse - because then it won't center.
     if config.ffm_flag().is_none() {
         config.set_skip_reshuffle(false);
+        commands
+            .entity(focused_entity)
+            .try_insert(PendingFocusLayout);
     }
     config.set_ffm_flag(None);
 }
@@ -214,11 +236,19 @@ fn shares_a_tab_group(
 }
 
 #[instrument(level = Level::DEBUG, skip_all, fields(focused))]
-fn fix_window_size_on_focus(
-    focused: Single<Entity, Added<FocusedMarker>>,
+pub(super) fn fix_window_size_on_focus(
+    focused: Single<(Entity, Has<VerifyWindowSize>), Added<FocusedMarker>>,
     mut windows: Query<(&mut Window, &mut Bounds, Has<ResizeMarker>)>,
+    mut commands: Commands,
 ) {
-    if let Ok((mut window, mut bounds, resizing)) = windows.get_mut(*focused)
+    let (entity, verify_size) = *focused;
+    if !verify_size {
+        return;
+    }
+    if let Ok(mut entity_commands) = commands.get_entity(entity) {
+        entity_commands.try_remove::<VerifyWindowSize>();
+    }
+    if let Ok((mut window, mut bounds, resizing)) = windows.get_mut(entity)
         && !resizing
         && let Ok(frame) = window.update_frame()
         && frame.size() != bounds.0
@@ -344,15 +374,6 @@ fn autocenter_window_on_focus(
     }
     if active_display.active_strip().tabbed(entity) {
         return;
-    }
-    if ctx.config.auto_center()
-        && let Some((_, _, None)) = ctx.windows.get_managed(entity)
-        && let Some(size) = ctx.windows.size(entity)
-        && let Some(mut origin) = ctx.windows.origin(entity)
-    {
-        let center = active_display.bounds().center();
-        origin.x = center.x - size.x / 2;
-        ctx.commands.reposition_entity(entity, origin);
     }
     ctx.commands.reshuffle_around(entity);
 }

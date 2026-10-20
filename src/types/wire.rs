@@ -223,6 +223,8 @@ mod tests {
             app_name: "Test App".to_string(),
             bundle_id: "com.example.test".to_string(),
             title: format!("Window {id}"),
+            role: Some("AXWindow".to_string()),
+            subrole: Some("AXStandardWindow".to_string()),
             frame: Some(Frame {
                 x: 0,
                 y: 0,
@@ -269,7 +271,7 @@ mod tests {
         assert_eq!(decoded.east(1), Some(2));
         // Ops are deliberately not carried: a set off the wire is one nothing
         // has been asked of yet.
-        assert!(decoded.ops().is_empty());
+        assert_eq!(decoded.ops(), []);
     }
 
     #[test]
